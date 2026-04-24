@@ -13,13 +13,38 @@
 
 export type Platform = 'discord' | 'telegram'
 
+/**
+ * Media attached to an inbound message. The adapter downloads the file to a
+ * local path before handing the InboundMessage to the app layer; app code
+ * just reads from `path`. Cleanup of the downloaded file is the app's
+ * responsibility (or the OS's, if files live in /tmp).
+ */
+export type AttachmentKind = 'image' | 'voice' | 'audio' | 'video' | 'document'
+
+export interface Attachment {
+  kind: AttachmentKind
+  /** Absolute filesystem path where the file was downloaded. */
+  path: string
+  /** Original filename, if the platform provided one. */
+  filename?: string
+  /** MIME type, if the platform provided one. */
+  mimeType?: string
+  /** Size in bytes, if known. */
+  sizeBytes?: number
+  /** Duration in seconds for audio/video, if known. */
+  durationSec?: number
+  /** Platform-native file identifier (Telegram file_id, Discord attachment id). */
+  platformFileId?: string
+}
+
 export interface InboundMessage {
   platform: Platform
   /** Platform-native channel/chat identifier (string form). */
   chatId: string
   /** Platform-native message ID. Used for reply/reaction targeting. */
   messageId: string
-  /** Text content, with bot @mentions already stripped. */
+  /** Text content, with bot @mentions already stripped. Can be empty if the
+   *  message is media-only. */
   text: string
   /** Author identity info. Not required for routing but useful for logs. */
   author: {
@@ -30,6 +55,8 @@ export interface InboundMessage {
   }
   /** If this message replies to another, the parent's messageId. */
   replyToMessageId?: string
+  /** Media files on the message. Empty array or undefined = text-only. */
+  attachments?: Attachment[]
   /** Platform-specific extras (Discord guild id, Telegram chat type, etc.). */
   raw?: Record<string, unknown>
   /** When the adapter observed this message (ISO). */

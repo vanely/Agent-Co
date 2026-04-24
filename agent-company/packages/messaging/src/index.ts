@@ -36,6 +36,21 @@ export { escapeTelegramMarkdownV2, stripTelegramFormatting, sanitizeDiscord } fr
 export { DiscordAdapter, type DiscordAdapterConfig } from './adapters/discord.js'
 export { TelegramAdapter, type TelegramAdapterConfig } from './adapters/telegram.js'
 export { PostgresPersistence, type PostgresPersistenceOptions } from './persistence.js'
+export {
+  transcribeAudio,
+  type TranscribeConfig,
+  type TranscribeProvider,
+  type TranscribeResult,
+  type LocalTranscriber,
+  type LocalWhisperModel,
+} from './transcribe.js'
+export {
+  synthesizeSpeech,
+  type SynthesizeConfig,
+  type SynthesizeResult,
+  type SynthesisProvider,
+  type SynthesisFormat,
+} from './synthesize.js'
 
 import type {
   MessagingClientConfig, InboundMessage, OutboundMessage, OutboundResult, ReactionEmoji,
