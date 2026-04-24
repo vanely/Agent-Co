@@ -1,0 +1,254 @@
+{
+  "name": "01 - Lead Scraper Orchestrator",
+  "nodes": [
+    {
+      "id": "trigger-schedule",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "get-pending-jobs",
+      "name": "Get Pending Scrape Jobs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM memory.scrape_state WHERE completed = false AND (last_run IS NULL OR last_run < NOW() - INTERVAL '24 hours') ORDER BY last_run ASC NULLS FIRST LIMIT 10",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "split-batches",
+      "name": "Split Into Jobs",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "route-by-source",
+      "name": "Route By Source",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        900,
+        300
+      ],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.source }}",
+                    "rightValue": "google_maps",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "google_maps"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.source }}",
+                    "rightValue": "yelp",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "yelp"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "run-google-maps",
+      "name": "Run Google Maps Scraper",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        220
+      ],
+      "parameters": {
+        "source": "localFile",
+        "workflowPath": "=/workflows/02-scrape-google-maps.json",
+        "options": {}
+      }
+    },
+    {
+      "id": "run-yelp",
+      "name": "Run Yelp Scraper",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        420
+      ],
+      "parameters": {
+        "source": "localFile",
+        "workflowPath": "=/workflows/03-scrape-yelp.json",
+        "options": {}
+      }
+    },
+    {
+      "id": "update-last-run",
+      "name": "Update Last Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE memory.scrape_state SET last_run = NOW() WHERE source = '{{ $json.source }}' AND query = '{{ $json.query }}'",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Pending Scrape Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Pending Scrape Jobs": {
+      "main": [
+        [
+          {
+            "node": "Split Into Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Into Jobs": {
+      "main": [
+        [
+          {
+            "node": "Route By Source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route By Source": {
+      "main": [
+        [
+          {
+            "node": "Run Google Maps Scraper",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Run Yelp Scraper",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Google Maps Scraper": {
+      "main": [
+        [
+          {
+            "node": "Update Last Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Yelp Scraper": {
+      "main": [
+        [
+          {
+            "node": "Update Last Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "nHzJlPJf4qiWlWNC"
+  },
+  "staticData": null,
+  "id": "gZagsDyJNhaXNcsC"
+}

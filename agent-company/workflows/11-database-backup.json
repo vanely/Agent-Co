@@ -1,0 +1,198 @@
+{
+  "id": "b8a2c4d6-e8f0-4a2b-9c4d-6e8f0a2b4c6d",
+  "name": "11 - Database Backup (Daily)",
+  "nodes": [
+    {
+      "id": "schedule-trigger",
+      "name": "Daily at 3am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 3,
+              "field": "cronExpression",
+              "expression": "0 3 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "run-backup",
+      "name": "Call Relay Backup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/backup-db",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{}",
+        "options": {
+          "timeout": 60000
+        }
+      }
+    },
+    {
+      "id": "check-result",
+      "name": "Backup OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.success }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "log-success",
+      "name": "Log Backup Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        900,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO memory.task_log (agent_id, workflow_name, task, output, status, completed_at)\nVALUES (\n  'db-backup',\n  '11-database-backup',\n  'scheduled-backup',\n  '{{ JSON.stringify({filename: $json.filename, size: $json.size}).replace(/'/g, \"''\") }}'::jsonb,\n  'success',\n  NOW()\n)",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "log-failure",
+      "name": "Log Backup Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        900,
+        420
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO memory.task_log (agent_id, workflow_name, task, output, status, error_msg, completed_at)\nVALUES (\n  'db-backup',\n  '11-database-backup',\n  'scheduled-backup',\n  '{}'::jsonb,\n  'failed',\n  '{{ ($json.error || \"\").replace(/'/g, \"''\") }}',\n  NOW()\n)",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "cleanup-old",
+      "name": "Cleanup Old Backups",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        200
+      ],
+      "parameters": {
+        "command": "find /workspace/../backups/ -name 'agentco_*.sql' -mtime +{{ $env.BACKUP_RETENTION_DAYS }} -delete 2>/dev/null; echo \"Cleaned backups older than 7 days\""
+      }
+    }
+  ],
+  "connections": {
+    "Daily at 3am": {
+      "main": [
+        [
+          {
+            "node": "Call Relay Backup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Relay Backup": {
+      "main": [
+        [
+          {
+            "node": "Backup OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backup OK?": {
+      "main": [
+        [
+          {
+            "node": "Log Backup Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Backup Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Backup Success": {
+      "main": [
+        [
+          {
+            "node": "Cleanup Old Backups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "nHzJlPJf4qiWlWNC"
+  },
+  "staticData": null
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=Agent Co — Daily Learning Flywheel consolidation
+After=agentco-relay.service
+Wants=agentco-relay.service
+
+[Service]
+Type=oneshot
+WorkingDirectory={{AGENT_CO_ROOT}}
+ExecStart=/bin/bash -c 'TOKEN=$(grep "^RELAY_SECRET=" {{AGENT_CO_ROOT}}/agent-company/.env | cut -d= -f2-); /usr/bin/curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\\"minPending\\":5}" http://localhost:3456/consolidate-learnings'
+StandardOutput=journal
+StandardError=journal
+Environment=HOME={{HOME}}
+Environment=AGENT_CO_ROOT={{AGENT_CO_ROOT}}
+Environment=PATH={{HOME}}/.local/bin:/usr/bin:/bin

@@ -1,0 +1,10 @@
+[Unit]
+Description=Agent Co — Daily Claude Code drift check at 07:00
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+Persistent=true
+AccuracySec=10min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""agentco-session — export / import Claude Code sessions.
+
+Scope is strictly per-session. This tool does NOT touch any agent-co
+infrastructure (Postgres, workflows, skills library itself). For a system-wide
+backup (schema dump + shared skills), use the separate backup script.
+
+A "session" is one subdirectory under ~/.claude/projects/, keyed by the CWD
+it was created in. Inside a session directory you'll find:
+  - *.jsonl          full conversation transcripts
+  - memory/*.md      the auto-loaded memory files (if the agent uses them)
+
+Subcommands:
+  list                   Show all sessions with slug, last-active, counts.
+  export [flags]         Interactive picker; export selected session(s) to
+                         ~/agent-co-exports/<slug>_<timestamp>/.
+  import <path>          Read an export directory; per-section prompt to
+                         replace / merge / skip into a target session.
+
+Export scopes (for `export --scope=X`):
+  memory        (default) just the memory/ MD files
+  full          memory + transcripts (*.jsonl) + skills (from CWD/skills/)
+  skills-only   just the skills directory of the session's rooted CWD
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import socket
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+CC_PROJECTS = Path.home() / ".claude" / "projects"
+DEFAULT_EXPORT_ROOT = Path.home() / "agent-co-exports"
+
+# ── Terminal colors ──────────────────────────────────────────────────────────
+def _color(code: str) -> str:
+    return code if sys.stdout.isatty() else ""
+
+C_RESET = _color("\033[0m")
+C_BOLD = _color("\033[1m")
+C_DIM = _color("\033[2m")
+C_CYAN = _color("\033[36m")
+C_GREEN = _color("\033[32m")
+C_YELLOW = _color("\033[33m")
+C_RED = _color("\033[31m")
+C_MAGENTA = _color("\033[35m")
+
+
+def ok(msg: str) -> None:
+    print(f"{C_GREEN}✓{C_RESET} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{C_YELLOW}!{C_RESET} {msg}")
+
+
+def err(msg: str) -> None:
+    print(f"{C_RED}✗{C_RESET} {msg}", file=sys.stderr)
+
+
+def step(msg: str) -> None:
+    print(f"{C_CYAN}▸{C_RESET} {msg}")
+
+
+def heading(msg: str) -> None:
+    print(f"\n{C_BOLD}{C_MAGENTA}{msg}{C_RESET}")
+    print(f"{C_DIM}{'─' * len(msg)}{C_RESET}")
+
+
+# ── Session discovery ────────────────────────────────────────────────────────
+
+def discover_sessions() -> list[dict]:
+    """Return a list of session dicts sorted by last_active desc."""
+    if not CC_PROJECTS.is_dir():
+        return []
+
+    sessions: list[dict] = []
+    for slug_dir in sorted(CC_PROJECTS.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        if not slug_dir.name.startswith("-"):
+            # CC convention: CWD-encoded slugs start with "-" because of the
+            # leading "/". Anything else is probably a stray dir.
+            continue
+
+        transcripts = list(slug_dir.glob("*.jsonl"))
+        if not transcripts:
+            # No transcripts → likely an abandoned or never-used session.
+            continue
+
+        # Last-active = most recent mtime across all transcripts.
+        last_mtime = max(t.stat().st_mtime for t in transcripts)
+
+        # Message count = sum of JSONL lines (rough; includes system events).
+        message_count = 0
+        for t in transcripts:
+            try:
+                with t.open("rb") as f:
+                    message_count += sum(1 for _ in f)
+            except OSError:
+                continue
+
+        # Memory files (if any)
+        memory_dir = slug_dir / "memory"
+        memory_count = (
+            sum(1 for _ in memory_dir.glob("*.md")) if memory_dir.is_dir() else 0
+        )
+
+        # Decode CWD from a transcript's init event (more reliable than
+        # slug parsing when paths contain dashes).
+        cwd = _decode_session_cwd(slug_dir)
+
+        # Claude Code's session customTitle (set via `claude --name <title>`).
+        # Used by CC to group resumable sessions — independent of the agent
+        # identity in SOUL.md. Surfacing it here because the two "names" cause
+        # confusion otherwise.
+        custom_title = _read_custom_title(slug_dir)
+
+        # Agent name from context/SOUL.md at the CWD — the identity the user
+        # gave the agent. Independent of customTitle.
+        agent_name = _read_agent_name(cwd) if cwd else None
+
+        sessions.append(
+            {
+                "slug": slug_dir.name,
+                "dir": slug_dir,
+                "cwd": str(cwd) if cwd else None,
+                "last_active": datetime.fromtimestamp(last_mtime, tz=timezone.utc),
+                "transcripts": len(transcripts),
+                "message_count": message_count,
+                "memory_files": memory_count,
+                "agent_name": agent_name,
+                "custom_title": custom_title,
+            }
+        )
+
+    sessions.sort(key=lambda s: s["last_active"], reverse=True)
+    return sessions
+
+
+def _decode_session_cwd(slug_dir: Path) -> Path | None:
+    """Find the session's CWD by scanning any transcript for a `cwd` field.
+    Claude Code emits the CWD in multiple event types (init, local_command,
+    etc.), so we take the first one we see. Falls back to naive slug decoding
+    if no cwd-bearing event is present.
+
+    We read a bounded number of lines per file to keep this fast on huge
+    transcripts (full sessions can be 100MB+)."""
+    MAX_LINES_PER_FILE = 200  # cwd almost always appears in the first handful
+    for jsonl in sorted(slug_dir.glob("*.jsonl"), key=lambda p: -p.stat().st_size):
+        try:
+            with jsonl.open() as f:
+                for i, line in enumerate(f):
+                    if i >= MAX_LINES_PER_FILE:
+                        break
+                    line = line.strip()
+                    if not line or '"cwd"' not in line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    cwd = entry.get("cwd")
+                    if isinstance(cwd, str) and cwd.startswith("/"):
+                        return Path(cwd)
+        except OSError:
+            continue
+    # Fallback: slug decode (fragile if CWD contained dashes)
+    slug = slug_dir.name
+    if slug.startswith("-"):
+        return Path(slug.replace("-", "/"))
+    return None
+
+
+def _read_custom_title(slug_dir: Path) -> str | None:
+    """Extract the Claude Code customTitle from any transcript's opening line.
+    Set by `claude --name <title>` at session spawn. Lives near the top of
+    each JSONL file; read a small window to keep this fast."""
+    MAX_LINES = 20
+    for jsonl in sorted(slug_dir.glob("*.jsonl"), key=lambda p: -p.stat().st_mtime):
+        try:
+            with jsonl.open() as f:
+                for i, line in enumerate(f):
+                    if i >= MAX_LINES:
+                        break
+                    if '"customTitle"' not in line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    title = entry.get("customTitle")
+                    if isinstance(title, str) and title:
+                        return title
+        except OSError:
+            continue
+    return None
+
+
+def _read_agent_name(cwd: Path) -> str | None:
+    """Best-effort: read context/SOUL.md at the session's CWD and pull the
+    agent name from the 'I am **<name>**.' line."""
+    soul = cwd / "context" / "SOUL.md"
+    if not soul.is_file():
+        return None
+    try:
+        content = soul.read_text()
+        for line in content.splitlines():
+            if "I am **" in line:
+                start = line.find("I am **") + len("I am **")
+                end = line.find("**", start)
+                if end > start:
+                    return line[start:end].strip()
+    except OSError:
+        pass
+    return None
+
+
+def _humanize_timedelta(dt: datetime) -> str:
+    delta = datetime.now(tz=timezone.utc) - dt
+    total = int(delta.total_seconds())
+    if total < 60:
+        return f"{total}s ago"
+    if total < 3600:
+        return f"{total // 60}m ago"
+    if total < 86400:
+        return f"{total // 3600}h ago"
+    if total < 30 * 86400:
+        return f"{total // 86400}d ago"
+    return dt.strftime("%Y-%m-%d")
+
+
+# ── List command ─────────────────────────────────────────────────────────────
+
+def cmd_list(args: argparse.Namespace) -> int:
+    sessions = discover_sessions()
+    if not sessions:
+        warn(f"No Claude Code sessions found under {CC_PROJECTS}")
+        return 0
+
+    heading(f"Claude Code sessions ({len(sessions)} found)")
+    print()
+    print(f"  {C_DIM}agent{C_RESET} = identity in SOUL.md   "
+          f"{C_DIM}title{C_RESET} = CC customTitle (session-group key)")
+    print()
+    print(f"  {'#':>3}  {'agent':<12} {'title':<14} {'last active':<12} {'msgs':>6} {'mem':>4}  slug")
+    print(f"  {'─' * 3}  {'─' * 12} {'─' * 14} {'─' * 12} {'─' * 6} {'─' * 4}  {'─' * 45}")
+    for i, s in enumerate(sessions, 1):
+        name = s["agent_name"] or "—"
+        title = s.get("custom_title") or "—"
+        last = _humanize_timedelta(s["last_active"])
+        print(
+            f"  {i:>3}. {name[:12]:<12} {title[:14]:<14} {last:<12} "
+            f"{s['message_count']:>6} {s['memory_files']:>4}  "
+            f"{C_DIM}{s['slug'][:45]}{C_RESET}"
+        )
+    print()
+    if args.verbose:
+        for i, s in enumerate(sessions, 1):
+            print(f"  [{i}] {s['slug']}")
+            print(f"       cwd: {s['cwd']}")
+            print(f"       dir: {s['dir']}")
+            print()
+    return 0
+
+
+# ── Export command ───────────────────────────────────────────────────────────
+
+def _interactive_pick(sessions: list[dict]) -> list[dict]:
+    """Prompt the user to pick one or more sessions. Accepts:
+      - a single number ('3')
+      - comma-separated ('1,3,5')
+      - range ('2-4')
+      - 'all'
+    Returns selected session list."""
+    print()
+    print(f"  {C_DIM}Examples:  {C_BOLD}3{C_RESET}{C_DIM} (single)   "
+          f"{C_BOLD}1,4,7{C_RESET}{C_DIM} (list)   "
+          f"{C_BOLD}2-5{C_RESET}{C_DIM} (range)   "
+          f"{C_BOLD}1,3-5,9{C_RESET}{C_DIM} (mixed)   "
+          f"{C_BOLD}all{C_RESET}{C_DIM}   {C_BOLD}q{C_RESET}{C_DIM} to quit{C_RESET}")
+    while True:
+        prompt = f"\n  {C_BOLD}Pick session(s) to export:{C_RESET} "
+        raw = input(prompt).strip().lower()
+        if raw in ("q", "quit", ""):
+            return []
+        if raw == "all":
+            return sessions
+        indices: set[int] = set()
+        try:
+            for part in raw.split(","):
+                part = part.strip()
+                if "-" in part:
+                    lo, hi = part.split("-", 1)
+                    for i in range(int(lo), int(hi) + 1):
+                        indices.add(i)
+                else:
+                    indices.add(int(part))
+        except ValueError:
+            warn("Could not parse; try again (e.g. '1' or '1,3' or '2-5')")
+            continue
+        picked = [sessions[i - 1] for i in sorted(indices) if 1 <= i <= len(sessions)]
+        if not picked:
+            warn("No valid selections; try again")
+            continue
+        return picked
+
+
+def _copy_dir_if_exists(src: Path, dst: Path) -> int:
+    """Recursively copy src -> dst if src exists. Returns file count copied."""
+    if not src.is_dir():
+        return 0
+    dst.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for item in src.rglob("*"):
+        if item.is_file():
+            rel = item.relative_to(src)
+            target = dst / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+            n += 1
+    return n
+
+
+def export_one(session: dict, scope: str, out_root: Path) -> Path:
+    """Export a single session. Returns the created directory path."""
+    timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_slug = session["slug"].lstrip("-")[:60] or "session"
+    name_bit = session["agent_name"] or safe_slug
+    out_dir = out_root / f"{name_bit}_{timestamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    counts = {"memory": 0, "transcripts": 0, "skills": 0}
+
+    # Memory (default scope + full)
+    if scope in ("memory", "full"):
+        counts["memory"] = _copy_dir_if_exists(
+            session["dir"] / "memory", out_dir / "memory"
+        )
+
+    # Transcripts (full only)
+    if scope == "full":
+        transcripts_dst = out_dir / "transcripts"
+        transcripts_dst.mkdir(exist_ok=True)
+        n = 0
+        for t in session["dir"].glob("*.jsonl"):
+            shutil.copy2(t, transcripts_dst / t.name)
+            n += 1
+        counts["transcripts"] = n
+
+    # Skills (full + skills-only) — from the session's CWD
+    if scope in ("full", "skills-only") and session.get("cwd"):
+        skills_src = Path(session["cwd"]) / "skills"
+        counts["skills"] = _copy_dir_if_exists(skills_src, out_dir / "skills")
+
+    # Manifest
+    manifest = {
+        "schema_version": 1,
+        "tool": "agentco-session",
+        "exported_at": datetime.now(tz=timezone.utc).isoformat(),
+        "source_hostname": socket.gethostname(),
+        "source_user": os.environ.get("USER", "unknown"),
+        "session_slug": session["slug"],
+        "session_cwd": session["cwd"],
+        "agent_name": session["agent_name"],       # SOUL.md identity
+        "session_title": session.get("custom_title"),  # Claude Code customTitle
+        "scope": scope,
+        "counts": counts,
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    return out_dir
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    sessions = discover_sessions()
+    if not sessions:
+        err(f"No sessions found under {CC_PROJECTS}")
+        return 1
+
+    if args.slug:
+        picked = [s for s in sessions if s["slug"] == args.slug]
+        if not picked:
+            err(f"No session with slug {args.slug!r}")
+            return 1
+    else:
+        cmd_list(argparse.Namespace(verbose=False))
+        picked = _interactive_pick(sessions)
+        if not picked:
+            warn("Nothing selected; aborted.")
+            return 0
+
+    out_root = Path(args.out) if args.out else DEFAULT_EXPORT_ROOT
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    heading(f"Exporting {len(picked)} session(s) with scope={args.scope}")
+    for s in picked:
+        step(f"{s['agent_name'] or s['slug']} …")
+        out = export_one(s, args.scope, out_root)
+        manifest = json.loads((out / "manifest.json").read_text())
+        ok(
+            f"→ {out}  "
+            f"(memory:{manifest['counts']['memory']} "
+            f"transcripts:{manifest['counts']['transcripts']} "
+            f"skills:{manifest['counts']['skills']})"
+        )
+    print()
+    step(f"Archive location: {out_root}")
+    return 0
+
+
+# ── Import command ───────────────────────────────────────────────────────────
+
+def _ask(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        ans = input(f"  {prompt}{suffix}: ").strip()
+    except EOFError:
+        return default
+    return ans or default
+
+
+def _ask_choice(prompt: str, options: list[str], default: str) -> str:
+    """Prompt for one of `options`; the default appears UPPERCASED in the
+    list, so the redundant `[default]` suffix is suppressed for cleanliness."""
+    opts_str = "/".join(o if o != default else o.upper() for o in options)
+    while True:
+        full_prompt = f"  {prompt} [{opts_str}]: "
+        try:
+            raw = input(full_prompt).strip().lower()
+        except EOFError:
+            return default
+        ans = raw or default
+        if ans in options:
+            return ans
+        warn(f"Pick one of: {', '.join(options)}")
+
+
+def _current_install_slug() -> str | None:
+    root = os.environ.get("AGENT_CO_ROOT")
+    if not root:
+        # Infer from the script location: bin/agentco-session → $AGENT_CO_ROOT/bin/
+        script_dir = Path(__file__).resolve().parent
+        if script_dir.name == "bin":
+            root = str(script_dir.parent)
+    if not root:
+        return None
+    return root.replace("/", "-")
+
+
+def _merge_dir(src: Path, dst: Path, strategy: str) -> tuple[int, int]:
+    """Apply `strategy` to merge src into dst. Returns (copied, skipped).
+
+    Strategies:
+      replace — back up dst then copy src verbatim
+      merge   — add files that don't exist; for collisions, keep both (rename import
+                with .imported suffix)
+      skip    — do nothing
+    """
+    if strategy == "skip":
+        return (0, 0)
+
+    if not src.is_dir():
+        return (0, 0)
+
+    if strategy == "replace":
+        if dst.exists():
+            backup = dst.with_name(
+                f"{dst.name}.pre-import.{datetime.now(tz=timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+            )
+            shutil.move(str(dst), str(backup))
+            step(f"backed up existing {dst.name}/ → {backup.name}/")
+        shutil.copytree(src, dst)
+        return (sum(1 for _ in dst.rglob("*") if _.is_file()), 0)
+
+    if strategy == "merge":
+        dst.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        skipped = 0
+        for item in src.rglob("*"):
+            if not item.is_file():
+                continue
+            rel = item.relative_to(src)
+            target = dst / rel
+            if target.exists():
+                # Compare bytes; if identical, skip silently. Otherwise keep both.
+                try:
+                    if item.read_bytes() == target.read_bytes():
+                        skipped += 1
+                        continue
+                except OSError:
+                    pass
+                # Rename imported file with suffix
+                renamed = target.with_stem(target.stem + ".imported")
+                renamed.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, renamed)
+                copied += 1
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, target)
+                copied += 1
+        return (copied, skipped)
+
+    return (0, 0)
+
+
+def _merge_transcripts(src: Path, dst: Path, strategy: str) -> tuple[int, int]:
+    """Transcript files (*.jsonl) live directly in the session dir, not under
+    a subdir. This merges them with the same strategies as dirs."""
+    if strategy == "skip" or not src.is_dir():
+        return (0, 0)
+
+    if strategy == "replace":
+        # Back up all existing .jsonl, copy imports
+        existing = list(dst.glob("*.jsonl"))
+        if existing:
+            backup = dst / f".transcripts.pre-import.{datetime.now(tz=timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+            backup.mkdir(exist_ok=True)
+            for t in existing:
+                shutil.move(str(t), str(backup / t.name))
+            step(f"backed up {len(existing)} existing transcript(s) → {backup.name}/")
+
+    copied = 0
+    for t in src.glob("*.jsonl"):
+        target = dst / t.name
+        if strategy == "merge" and target.exists():
+            # jsonl collisions: keep both; rename import
+            renamed = dst / f"{t.stem}.imported{t.suffix}"
+            shutil.copy2(t, renamed)
+        else:
+            shutil.copy2(t, target)
+        copied += 1
+    return (copied, 0)
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    import_path = Path(args.path).expanduser().resolve()
+    if not import_path.is_dir():
+        err(f"Not a directory: {import_path}")
+        return 1
+
+    manifest_file = import_path / "manifest.json"
+    if not manifest_file.is_file():
+        err(f"No manifest.json at {import_path} — not a valid export")
+        return 1
+
+    try:
+        manifest = json.loads(manifest_file.read_text())
+    except json.JSONDecodeError as e:
+        err(f"Bad manifest.json: {e}")
+        return 1
+
+    heading("Import preview")
+    print(f"  source host   : {manifest.get('source_hostname', '?')}")
+    print(f"  exported at   : {manifest.get('exported_at', '?')}")
+    print(f"  agent name    : {manifest.get('agent_name') or '(unnamed)'}   {C_DIM}(from SOUL.md){C_RESET}")
+    print(f"  session title : {manifest.get('session_title') or '(none)'}   {C_DIM}(CC customTitle){C_RESET}")
+    print(f"  session slug  : {manifest.get('session_slug', '?')}")
+    print(f"  scope         : {manifest.get('scope', '?')}")
+    counts = manifest.get("counts", {})
+    print(
+        f"  contents      : memory={counts.get('memory', 0)}  "
+        f"transcripts={counts.get('transcripts', 0)}  "
+        f"skills={counts.get('skills', 0)}"
+    )
+    print()
+
+    # Pick target session slug
+    default_slug = _current_install_slug() or manifest.get("session_slug", "")
+    heading("Target session")
+    print(
+        f"  Where should this land? A {C_BOLD}session slug{C_RESET} is Claude Code's CWD-encoded\n"
+        f"  identifier for a session (the CWD with `/` replaced by `-`, leading dash kept).\n\n"
+        f"  Examples:\n"
+        f"    {C_BOLD}-home-you-agent-co{C_RESET}         → the default install location\n"
+        f"    {C_BOLD}-home-you-Projects-work{C_RESET}    → a different project directory\n"
+        f"    {C_BOLD}-Users-you-agent-co{C_RESET}        → a macOS install\n\n"
+        f"  Press Enter to use the default (your current install's slug), or type\n"
+        f"  any slug to import into a different session (it will be created if missing).\n"
+    )
+    target_slug = _ask("Target slug", default_slug)
+    if not target_slug.startswith("-"):
+        warn(
+            "Slug doesn't start with '-' — Claude Code slugs are CWD-encoded "
+            "with a leading dash. Continuing anyway."
+        )
+    target_dir = CC_PROJECTS / target_slug
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-section strategies
+    heading("Per-section strategy")
+    print(
+        f"  For each section below, pick how to handle it:\n\n"
+        f"    {C_BOLD}replace{C_RESET}  back up the existing section (as <name>.pre-import.<timestamp>),\n"
+        f"             then copy the imported files on top. Destructive but clean.\n\n"
+        f"    {C_BOLD}merge{C_RESET}    add imported files that don't exist; on byte-identical collisions\n"
+        f"             skip silently; on content-different collisions keep both\n"
+        f"             (imported file gets an .imported suffix). Safe but requires cleanup.\n\n"
+        f"    {C_BOLD}skip{C_RESET}     don't touch this section at all.\n\n"
+        f"  The {C_BOLD}UPPERCASED{C_RESET} option in each prompt is the default — just press Enter to pick it.\n"
+    )
+
+    results: dict[str, tuple[int, int]] = {}
+
+    if counts.get("memory", 0) > 0:
+        strategy = _ask_choice(
+            f"memory ({counts['memory']} file(s))", ["replace", "merge", "skip"], "merge"
+        )
+        results["memory"] = _merge_dir(
+            import_path / "memory", target_dir / "memory", strategy
+        )
+
+    if counts.get("transcripts", 0) > 0:
+        strategy = _ask_choice(
+            f"transcripts ({counts['transcripts']} jsonl)",
+            ["replace", "merge", "skip"],
+            "skip",
+        )
+        results["transcripts"] = _merge_transcripts(
+            import_path / "transcripts", target_dir, strategy
+        )
+
+    if counts.get("skills", 0) > 0:
+        # Skills target: the CWD's skills/ directory, not the CC project dir.
+        # Use AGENT_CO_ROOT if set, else the manifest's cwd, else ask.
+        default_skills = os.environ.get("AGENT_CO_ROOT")
+        if not default_skills:
+            cwd_from_manifest = manifest.get("session_cwd")
+            if cwd_from_manifest:
+                default_skills = cwd_from_manifest
+        heading("Skills target directory")
+        print(
+            f"  Skills live at {C_BOLD}<install-root>/skills/{C_RESET}. Give me the install root and I'll\n"
+            f"  write into its skills/ subdirectory (creating it if missing).\n\n"
+            f"  Examples:\n"
+            f"    {C_BOLD}~/agent-co{C_RESET}                      → the default install location\n"
+            f"    {C_BOLD}/opt/shared-agent-co{C_RESET}            → a system-wide install\n"
+            f"    {C_BOLD}{default_skills or '(type a path)'}{C_RESET}\n\n"
+            f"  Press Enter to accept the default, or type a path. Blank = skip skills section.\n"
+        )
+        skills_target = _ask(
+            "Install root (blank to skip)",
+            default_skills or "",
+        )
+        if skills_target:
+            strategy = _ask_choice(
+                f"skills ({counts['skills']} file(s))",
+                ["replace", "merge", "skip"],
+                "merge",
+            )
+            results["skills"] = _merge_dir(
+                import_path / "skills", Path(skills_target) / "skills", strategy
+            )
+        else:
+            warn("No skills target given; skipping skills section.")
+
+    heading("Import complete")
+    for section, (copied, skipped) in results.items():
+        ok(f"{section}: {copied} copied, {skipped} skipped (identical)")
+    if not results:
+        warn("Nothing imported (all sections skipped or empty).")
+    return 0
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="agentco-session",
+        description="Export and import Claude Code sessions. "
+        "Session data only — does NOT touch the agent-co infra "
+        "(Postgres, workflows, shared skill library).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_list = sub.add_parser("list", help="Show all Claude Code sessions")
+    p_list.add_argument("--verbose", "-v", action="store_true", help="Show full paths")
+    p_list.set_defaults(func=cmd_list)
+
+    p_export = sub.add_parser("export", help="Export session(s) (interactive picker)")
+    p_export.add_argument(
+        "--scope",
+        choices=["memory", "full", "skills-only"],
+        default="memory",
+        help="What to include (default: memory)",
+    )
+    p_export.add_argument(
+        "--slug",
+        help="Export this exact slug instead of showing the picker",
+    )
+    p_export.add_argument(
+        "--out",
+        help=f"Output root directory (default: {DEFAULT_EXPORT_ROOT})",
+    )
+    p_export.set_defaults(func=cmd_export)
+
+    p_import = sub.add_parser("import", help="Import a previously-exported session")
+    p_import.add_argument("path", help="Path to an export directory")
+    p_import.set_defaults(func=cmd_import)
+
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print()
+        warn("Aborted.")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,11 @@
+{
+  "_comment": "Template: the setup CLI generates .mcp.json with absolute paths. DO NOT edit .mcp.json directly — run `bin/agentco setup` to regenerate.",
+  "mcpServers": {
+    "agentco": {
+      "type": "stdio",
+      "command": "{{AGENT_CO_ROOT}}/bin/agentco-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

@@ -1,0 +1,10 @@
+[Unit]
+Description=Agent Co — Learning Flywheel consolidation (daily 06:30)
+
+[Timer]
+OnCalendar=*-*-* 06:30:00
+Persistent=true
+AccuracySec=10min
+
+[Install]
+WantedBy=timers.target

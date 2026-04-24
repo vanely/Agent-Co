@@ -1,0 +1,135 @@
+{
+  "name": "02 - Scrape Google Maps",
+  "nodes": [
+    {
+      "id": "sub-trigger",
+      "name": "Sub-workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "run-scraper",
+      "name": "Run Scraper Script",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "command": "node /scripts/dist/lead-scraper/google-maps.js --query \"{{ $json.query }}\" --location \"{{ $json.location ?? 'United States' }}\" --page {{ $json.page ?? 0 }}"
+      }
+    },
+    {
+      "id": "parse-output",
+      "name": "Parse Scraper Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.stdout;\nif (!raw || raw.trim() === '') return [];\ntry {\n  const leads = JSON.parse(raw);\n  if (!Array.isArray(leads)) return [];\n  return leads.map(l => ({ json: l }));\n} catch (e) {\n  throw new Error('Scraper output is not valid JSON: ' + raw.slice(0, 200));\n}"
+      }
+    },
+    {
+      "id": "remove-dupes",
+      "name": "Remove Duplicates",
+      "type": "n8n-nodes-base.removeDuplicates",
+      "typeVersion": 1,
+      "position": [
+        900,
+        300
+      ],
+      "parameters": {
+        "compare": "selectedFields",
+        "fieldsToCompare": {
+          "fields": [
+            {
+              "fieldName": "dedup_hash"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "upsert-leads",
+      "name": "Upsert Into Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO leads.contacts (business_name, email, phone_number, website, address, city, state, category, average_rating, total_reviews, raw_data, dedup_hash, status) VALUES ('{{ $json.business_name }}', {{ $json.email ? \"'\" + $json.email + \"'\" : 'NULL' }}, {{ $json.phone ? \"'\" + $json.phone + \"'\" : 'NULL' }}, {{ $json.website ? \"'\" + $json.website + \"'\" : 'NULL' }}, {{ $json.address ? \"'\" + $json.address + \"'\" : 'NULL' }}, {{ $json.city ? \"'\" + $json.city + \"'\" : 'NULL' }}, {{ $json.state ? \"'\" + $json.state + \"'\" : 'NULL' }}, {{ $json.category ? \"'\" + $json.category + \"'\" : 'NULL' }}, {{ $json.rating ?? 'NULL' }}, {{ $json.review_count ?? 'NULL' }}, '{{ JSON.stringify($json.raw_data ?? {}) }}'::jsonb, '{{ $json.dedup_hash }}', 'new') ON CONFLICT (dedup_hash) DO NOTHING",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Sub-workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "Run Scraper Script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Scraper Script": {
+      "main": [
+        [
+          {
+            "node": "Parse Scraper Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Scraper Output": {
+      "main": [
+        [
+          {
+            "node": "Remove Duplicates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Remove Duplicates": {
+      "main": [
+        [
+          {
+            "node": "Upsert Into Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "id": "FNMlAX0IUBCfqwT7"
+}

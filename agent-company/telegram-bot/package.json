@@ -1,0 +1,23 @@
+{
+  "name": "agent-co-telegram-bot",
+  "version": "1.1.0",
+  "description": "Bidirectional Telegram interface for Agent Co — thin wrapper over @agentco/messaging. Routes messages to Claude (via UUID resume) and persists to memory.messages.",
+  "main": "dist/bot.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/bot.ts",
+    "start": "tsx src/bot.ts"
+  },
+  "dependencies": {
+    "@agentco/messaging": "file:../packages/messaging",
+    "dotenv": "^16.4.0",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

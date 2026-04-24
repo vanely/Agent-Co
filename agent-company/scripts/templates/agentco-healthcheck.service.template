@@ -1,0 +1,6 @@
+[Unit]
+Description=Agent Company — Health Check (restart dead services)
+
+[Service]
+Type=oneshot
+ExecStart={{PROJECT_DIR}}/scripts/healthcheck.sh

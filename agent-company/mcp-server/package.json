@@ -1,0 +1,23 @@
+{
+  "name": "agentco-mcp-server",
+  "version": "0.1.0",
+  "description": "Agent-co MCP server — exposes relay capabilities (notify, skill review, heartbeat) as tools to Claude Code CLI sessions",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "agentco-mcp": "./dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

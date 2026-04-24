@@ -1,0 +1,143 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agentco_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+      - ./scripts/sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    # Exposed to host so the relay server can connect directly
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - agentco
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: agentco_n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      # Core
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: http://localhost:5678/
+      GENERIC_TIMEZONE: ${TZ}
+
+      # Basic auth — always enabled
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+
+      # Encryption key — NEVER change after first run
+      # Changing it invalidates all stored credentials
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+
+      # Database backend — Postgres, not default SQLite
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+
+      # Re-enable Execute Command node (disabled by default in n8n v2.x)
+      # N8N_EXECUTE_COMMAND_ENABLED is NOT valid in v2 — use NODES_EXCLUDE instead.
+      # Default exclude list is: ["n8n-nodes-base.executeCommand","n8n-nodes-base.localFileTrigger"]
+      # Setting to empty array re-enables both nodes.
+      NODES_EXCLUDE: "[]"
+
+      # Allow workflows to read $env vars in expressions (blocked by default in n8n v2.x)
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+
+      # Secrets passed into container so scripts can read them via process.env
+      POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME}
+
+      # Relay URL — host.docker.internal resolves to host machine from inside container
+      # This is how n8n workflows call the claude CLI on the host
+      CLAUDE_RELAY_URL: http://host.docker.internal:${RELAY_PORT:-3456}
+
+      # Discord bot token — used by n8n to post replies back to Discord channels
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
+
+      # Workflow operational limits (see .env.example for docs)
+      EMAIL_DAILY_CAP: ${EMAIL_DAILY_CAP:-100}
+      EMAIL_BATCH_WAIT_SECONDS: ${EMAIL_BATCH_WAIT_SECONDS:-30}
+      MAX_FOLLOWUP_STEPS: ${MAX_FOLLOWUP_STEPS:-3}
+      SCRAPE_CHECK_WINDOW_HOURS: ${SCRAPE_CHECK_WINDOW_HOURS:-24}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+      HEARTBEAT_CRON_MINUTES: ${HEARTBEAT_CRON_MINUTES:-60}
+
+      # Execution log retention
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
+      EXECUTIONS_DATA_MAX_AGE: 168        # 7 days in hours
+
+      # Timeouts — agent tasks can run for minutes
+      EXECUTIONS_TIMEOUT: 3600            # 1 hour max per execution
+      EXECUTIONS_TIMEOUT_MAX: 7200        # absolute hard cap
+
+    volumes:
+      - ./n8n-data:/home/node/.n8n
+      - ./scripts:/scripts:ro             # TS scripts — read-only inside container
+      - ./prompts:/prompts:ro             # Prompt templates — loaded by Code nodes that call Claude
+      - ./config:/config:ro               # Config files (HEARTBEAT.md, etc.) — dir mount so atomic-write edits propagate without recreating the container
+      - ./workflows:/workflows:ro         # workflow JSON exports
+      - ${HOME}/.agent-co/workspace:/workspace  # Claude's workspace — context docs, research, projects
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # Linux: host.docker.internal requires explicit host-gateway mapping
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - agentco
+
+  # Dashboard — only starts when: docker compose --profile monitoring up -d
+  dashboard:
+    build: ./dashboard
+    container_name: agentco_dashboard
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - agentco
+    profiles:
+      - monitoring
+
+  # Postgres admin GUI — only starts when: docker compose --profile dev up -d
+  adminer:
+    image: adminer:latest
+    container_name: agentco_adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    networks:
+      - agentco
+    profiles:
+      - dev
+
+networks:
+  agentco:
+    driver: bridge

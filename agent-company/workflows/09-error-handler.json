@@ -1,0 +1,87 @@
+{
+  "name": "09 - Global Error Handler",
+  "nodes": [
+    {
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "parameters": {}
+    },
+    {
+      "id": "format-error",
+      "name": "Format Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "parameters": {
+        "jsCode": "const err = $input.first().json;\nreturn [{ json: {\n  workflow_name: err.workflow?.name ?? 'unknown',\n  node_name: err.execution?.lastNodeExecuted ?? 'unknown',\n  error_message: err.execution?.error?.message ?? 'No message',\n  execution_id: err.execution?.id ?? 'unknown',\n  timestamp: new Date().toISOString()\n}}];"
+      }
+    },
+    {
+      "id": "log-error",
+      "name": "Log Error To DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [680, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO memory.task_log (agent_id, workflow_name, task, status, error_msg) VALUES ('system', '{{ $json.workflow_name.replace(/'/g, \"''\") }}', '{{ $json.node_name.replace(/'/g, \"''\") }}', 'failed', '{{ $json.error_message.replace(/'/g, \"''\") }}')",
+        "options": {}
+      },
+      "credentials": {"postgres": {"id": "postgres-main", "name": "AgentCo Postgres"}}
+    },
+    {
+      "id": "report-error-event",
+      "name": "Report Error Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/workflow-event",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{"name": "Content-Type", "value": "application/json"}]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"workflowName\": {{ JSON.stringify($json.workflow_name) }},\n  \"executionId\": {{ JSON.stringify($json.execution_id) }},\n  \"status\": \"error\",\n  \"error\": {\n    \"nodeName\": {{ JSON.stringify($json.node_name) }},\n    \"message\": {{ JSON.stringify($json.error_message) }}\n  },\n  \"nodes\": [{\n    \"name\": {{ JSON.stringify($json.node_name) }},\n    \"type\": \"unknown\",\n    \"status\": \"error\",\n    \"error\": {{ JSON.stringify($json.error_message) }}\n  }]\n}",
+        "options": {}
+      }
+    },
+    {
+      "id": "alert-email",
+      "name": "Email Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [1120, 300],
+      "parameters": {
+        "fromEmail": "={{ $env.SMTP_USER }}",
+        "toEmail": "={{ $env.SMTP_USER }}",
+        "subject": "=[AgentCo] Workflow failure: {{ $json.workflow_name }}",
+        "emailType": "text",
+        "message": "=Workflow: {{ $json.workflow_name }}\nNode: {{ $json.node_name }}\nError: {{ $json.error_message }}\nTime: {{ $json.timestamp }}\nExecution ID: {{ $json.execution_id }}",
+        "options": {}
+      },
+      "credentials": {"smtp": {"id": "smtp-main", "name": "AgentCo SMTP"}}
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [[{"node": "Format Error", "type": "main", "index": 0}]]
+    },
+    "Format Error": {
+      "main": [[{"node": "Log Error To DB", "type": "main", "index": 0}]]
+    },
+    "Log Error To DB": {
+      "main": [[{"node": "Report Error Event", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "id": "nHzJlPJf4qiWlWNC"
+}

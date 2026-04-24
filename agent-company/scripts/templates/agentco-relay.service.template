@@ -1,0 +1,17 @@
+[Unit]
+Description=Agent Company — Claude Code Relay Server
+After=network.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory={{PROJECT_DIR}}/relay
+EnvironmentFile={{PROJECT_DIR}}/.env
+Environment=PATH={{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/node dist/server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:{{PROJECT_DIR}}/relay/relay.log
+StandardError=append:{{PROJECT_DIR}}/relay/relay.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,56 @@
+{
+  "name": "sub - Relay Healthcheck",
+  "nodes": [
+    {
+      "id": "sub-trigger",
+      "name": "Sub-workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "parameters": {}
+    },
+    {
+      "id": "health-get",
+      "name": "GET Relay Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/health",
+        "options": {
+          "timeout": 3000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "normalize",
+      "name": "Normalize Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300],
+      "parameters": {
+        "jsCode": "// Normalize health-check response to a consistent shape so callers don't have\n// to handle three cases (2xx ok, non-2xx body, transport error).\nconst input = $input.first();\nconst json = input?.json ?? {};\nconst err  = json.error || json.errorMessage;\n\nif (err) {\n  return [{ json: { healthy: false, status: 'unreachable', error: String(err).slice(0, 300) } }];\n}\n\n// Relay /health returns { status: 'ok', ... } on healthy; anything else is a soft fail.\nconst healthy = json.status === 'ok';\nreturn [{ json: {\n  healthy,\n  status: json.status || 'unknown',\n  port: json.port ?? null,\n  sessions: json.sessions ?? null,\n  discord: json.discord ?? null,\n  error: healthy ? null : 'relay reported non-ok status'\n}}];"
+      }
+    }
+  ],
+  "connections": {
+    "Sub-workflow Trigger": {
+      "main": [[{ "node": "GET Relay Health", "type": "main", "index": 0 }]]
+    },
+    "GET Relay Health": {
+      "main": [[{ "node": "Normalize Response", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "id": "sub-relay-healthcheck"
+}

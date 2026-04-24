@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentco.learning-consolidation</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>TOKEN=$(grep "^RELAY_SECRET=" {{AGENT_CO_ROOT}}/agent-company/.env | cut -d= -f2-); /usr/bin/curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"minPending":5}' http://localhost:3456/consolidate-learnings</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{{AGENT_CO_ROOT}}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AGENT_CO_ROOT</key>
+        <string>{{AGENT_CO_ROOT}}</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:{{HOME}}/.local/bin</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>{{AGENT_CO_ROOT}}/logs/learning-consolidation.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{AGENT_CO_ROOT}}/logs/learning-consolidation.log</string>
+</dict>
+</plist>

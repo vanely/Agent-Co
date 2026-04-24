@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentco.relay</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>{{AGENT_CO_ROOT}}/agent-company/relay/dist/server.js</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{AGENT_CO_ROOT}}/agent-company/relay</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AGENT_CO_ROOT</key>
+        <string>{{AGENT_CO_ROOT}}</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:{{HOME}}/.local/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{{AGENT_CO_ROOT}}/agent-company/relay/relay.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{AGENT_CO_ROOT}}/agent-company/relay/relay.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+</dict>
+</plist>

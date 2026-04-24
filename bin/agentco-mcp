@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# agentco-mcp — launcher for the agent-co MCP server.
+# Resolves AGENT_CO_ROOT from env or from the script's own location,
+# then execs the compiled MCP server entrypoint.
+set -euo pipefail
+
+# Find the repo root: the script lives at $AGENT_CO_ROOT/bin/agentco-mcp,
+# so its parent-of-parent is the root.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+AGENT_CO_ROOT="${AGENT_CO_ROOT:-$(dirname "$SCRIPT_DIR")}"
+export AGENT_CO_ROOT
+
+MCP_SERVER="$AGENT_CO_ROOT/agent-company/mcp-server/dist/server.js"
+if [ ! -f "$MCP_SERVER" ]; then
+  echo "error: MCP server not built. Run: cd $AGENT_CO_ROOT/agent-company/mcp-server && npm run build" >&2
+  exit 2
+fi
+
+exec node "$MCP_SERVER"

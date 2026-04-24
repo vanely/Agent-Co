@@ -1,0 +1,446 @@
+{
+  "name": "06 - Lead Researcher (Claude Code)",
+  "nodes": [
+    {
+      "id": "schedule",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9,15 * * 1-5"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "check-relay",
+      "name": "Check Relay Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/health",
+        "options": {}
+      }
+    },
+    {
+      "id": "relay-up",
+      "name": "Relay Up?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "ok",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "relay-down-error",
+      "name": "Relay Not Running",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        900,
+        420
+      ],
+      "parameters": {
+        "errorMessage": "Claude relay is not running. Start it: check relay health at http://localhost:3456/health"
+      }
+    },
+    {
+      "id": "get-leads",
+      "name": "Get Research Queue",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        900,
+        220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, business_name, email, website, city, state, category, owner_name, average_rating, total_reviews FROM leads.contacts WHERE status = 'researched' AND lead_score >= 70 ORDER BY lead_score DESC LIMIT 20",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "check-queue",
+      "name": "Any Leads To Research?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        220
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $input.all().length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "split-one",
+      "name": "One At A Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1340,
+        140
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "log-start",
+      "name": "Log Task Start",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        140
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO memory.task_log (agent_id, workflow_name, task, input, status) VALUES ('email-writer', 'lead-researcher', 'research_and_draft', '{{ JSON.stringify($json) }}'::jsonb, 'running') RETURNING id AS task_log_id",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "build-prompt",
+      "name": "Build Claude Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        140
+      ],
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst lead = $('One At A Time').item.json;\nconst taskLogId = $('Log Task Start').item.json.task_log_id;\n\n// Prompt template lives at agent-company/prompts/lead-researcher-cold-email.md\n// (mounted to /prompts inside the n8n container)\nconst template = fs.readFileSync('/prompts/lead-researcher-cold-email.md', 'utf-8');\n\nconst prompt = template\n  .replace(/\\{\\{business_name\\}\\}/g, lead.business_name ?? '')\n  .replace(/\\{\\{website\\}\\}/g, lead.website || 'not available')\n  .replace(/\\{\\{category\\}\\}/g, lead.category || 'fitness/wellness')\n  .replace(/\\{\\{city\\}\\}/g, lead.city ?? '')\n  .replace(/\\{\\{state\\}\\}/g, lead.state ?? '')\n  .replace(/\\{\\{owner_name\\}\\}/g, lead.owner_name || 'unknown')\n  .replace(/\\{\\{average_rating\\}\\}/g, String(lead.average_rating ?? ''))\n  .replace(/\\{\\{total_reviews\\}\\}/g, String(lead.total_reviews ?? ''));\n\nreturn [{ json: {\n  prompt,\n  lead_id: lead.id,\n  to_email: lead.email,\n  task_log_id: taskLogId\n}}];"
+      }
+    },
+    {
+      "id": "call-claude",
+      "name": "Call Claude Via Relay",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2000,
+        140
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/run-agent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"task\": {{ JSON.stringify($json.prompt) }},\n  \"timeoutSeconds\": 180\n}",
+        "options": {}
+      }
+    },
+    {
+      "id": "parse-claude",
+      "name": "Parse Claude Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2220,
+        140
+      ],
+      "parameters": {
+        "jsCode": "const result = $input.first().json;\nif (!result.success) {\n  throw new Error('Claude relay error: ' + result.error);\n}\nconst clean = result.output\n  .replace(/^```json\\s*/i, '')\n  .replace(/^```\\s*/i, '')\n  .replace(/```\\s*$/i, '')\n  .trim();\ntry {\n  const draft = JSON.parse(clean);\n  return [{ json: {\n    ...draft,\n    lead_id: $('Build Claude Prompt').item.json.lead_id,\n    to_email: $('Build Claude Prompt').item.json.to_email,\n    task_log_id: $('Build Claude Prompt').item.json.task_log_id\n  }}];\n} catch (e) {\n  throw new Error('Claude output is not valid JSON: ' + clean.slice(0, 300));\n}"
+      }
+    },
+    {
+      "id": "insert-draft",
+      "name": "Insert Email Draft",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2440,
+        140
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO outreach.emails (lead_id, to_email, subject, body, status) VALUES ('{{ $json.lead_id }}'::uuid, '{{ $json.to_email }}', '{{ $json.subject }}', '{{ $json.body }}', 'pending')",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "update-lead-status",
+      "name": "Mark Lead Researched",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2660,
+        140
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads.contacts SET status = 'researched', updated_at = NOW() WHERE id = '{{ $json.lead_id }}'::uuid",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "log-complete",
+      "name": "Log Task Complete",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        140
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE memory.task_log SET status = 'success', output = '{{ JSON.stringify($json) }}'::jsonb, completed_at = NOW(), duration_ms = EXTRACT(EPOCH FROM (NOW() - started_at))::int * 1000 WHERE id = '{{ $json.task_log_id }}'::uuid",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "no-op-2",
+      "name": "Nothing To Research",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1340,
+        320
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Check Relay Health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Relay Health": {
+      "main": [
+        [
+          {
+            "node": "Relay Up?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Relay Up?": {
+      "main": [
+        [
+          {
+            "node": "Get Research Queue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Relay Not Running",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Research Queue": {
+      "main": [
+        [
+          {
+            "node": "Any Leads To Research?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Leads To Research?": {
+      "main": [
+        [
+          {
+            "node": "One At A Time",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nothing To Research",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One At A Time": {
+      "main": [
+        [
+          {
+            "node": "Log Task Start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Task Start": {
+      "main": [
+        [
+          {
+            "node": "Build Claude Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Claude Prompt": {
+      "main": [
+        [
+          {
+            "node": "Call Claude Via Relay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Claude Via Relay": {
+      "main": [
+        [
+          {
+            "node": "Parse Claude Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Claude Output": {
+      "main": [
+        [
+          {
+            "node": "Insert Email Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Email Draft": {
+      "main": [
+        [
+          {
+            "node": "Mark Lead Researched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Lead Researched": {
+      "main": [
+        [
+          {
+            "node": "Log Task Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "nHzJlPJf4qiWlWNC"
+  },
+  "staticData": null,
+  "id": "HreI7sy2fv1rNAVg"
+}

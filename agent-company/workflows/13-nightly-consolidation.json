@@ -1,0 +1,319 @@
+{
+  "name": "13 - Nightly Memory Consolidation (Dreaming)",
+  "nodes": [
+    {
+      "id": "mc-cron",
+      "name": "Daily 2am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      },
+      "notes": "Nightly at 2am \u2014 reviews yesterday's messages across all channels and proposes memory updates."
+    },
+    {
+      "id": "mc-fetch",
+      "name": "Fetch Yesterday's Messages",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT channel_id, platform, role, content, username, created_at FROM memory.messages WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE ORDER BY channel_id, seq",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "mc-has-data",
+      "name": "Any Messages Yesterday?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $input.all().length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mc-build-prompt",
+      "name": "Build Consolidation Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        200
+      ],
+      "parameters": {
+        "jsCode": "const fs = require('fs');\n\n// Load the template (mounted into container at /prompts/)\nconst template = fs.readFileSync('/prompts/memory-consolidation.md', 'utf-8');\n\n// Group messages by channel_id\nconst all = $input.all().map(i => i.json);\nconst byChannel = {};\nfor (const m of all) {\n  byChannel[m.channel_id] = byChannel[m.channel_id] || [];\n  byChannel[m.channel_id].push(m);\n}\n\n// Build a readable conversations block\nconst chunks = [];\nconst channelsContributing = [];\nfor (const [chan, msgs] of Object.entries(byChannel)) {\n  const platform = msgs[0]?.platform || 'unknown';\n  channelsContributing.push(`${platform}:${chan}`);\n  chunks.push(`## ${platform} \u2014 ${chan} (${msgs.length} messages)`);\n  for (const m of msgs) {\n    const who = m.role === 'assistant' ? 'the agent' : (m.username || 'User');\n    const text = String(m.content || '').replace(/\\s+/g, ' ').slice(0, 800);\n    chunks.push(`${who}: ${text}`);\n  }\n  chunks.push('');\n}\n\nconst conversations = chunks.join('\\n');\nconst prompt = template.replace(/\\{\\{conversations\\}\\}/g, conversations);\n\n// Yesterday's date ISO for source_date\nconst d = new Date();\nd.setUTCDate(d.getUTCDate() - 1);\nconst sourceDate = d.toISOString().slice(0, 10);\n\nreturn [{ json: { prompt, sourceDate, channelsContributing, messageCount: all.length } }];"
+      }
+    },
+    {
+      "id": "mc-relay",
+      "name": "Call Claude Via Relay",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1120,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/run-agent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"task\": {{ JSON.stringify($json.prompt) }},\n  \"timeoutSeconds\": 600,\n  \"channelId\": \"consolidation\"\n}",
+        "options": {}
+      }
+    },
+    {
+      "id": "mc-parse",
+      "name": "Parse PROPOSED MEMORY UPDATE Blocks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        200
+      ],
+      "parameters": {
+        "jsCode": "const result = $input.first().json;\nconst output = String(result.output || '').trim();\nconst ctx = $('Build Consolidation Prompt').item.json;\n\nif (output === 'NO_PROPOSALS' || output.startsWith('NO_PROPOSALS')) {\n  return [{ json: { skip: true, reason: 'NO_PROPOSALS', sourceDate: ctx.sourceDate, messageCount: ctx.messageCount } }];\n}\n\n// Parse blocks of the form:\n//   **PROPOSED MEMORY UPDATE:** <name>\n//   Type: <type>\n//   Body:\n//   <body...>\n//   Source channels: <csv>\nconst blocks = output.split(/\\n(?=\\*\\*PROPOSED MEMORY UPDATE:\\*\\*)/);\nconst proposals = [];\n\nfor (const block of blocks) {\n  if (!block.includes('PROPOSED MEMORY UPDATE')) continue;\n  const nameMatch = block.match(/\\*\\*PROPOSED MEMORY UPDATE:\\*\\*\\s*(.+)/);\n  const typeMatch = block.match(/Type:\\s*(user|feedback|project|reference)/i);\n  const bodyMatch = block.match(/Body:\\s*\\n([\\s\\S]*?)(?=\\n(?:Source channels:|\\*\\*PROPOSED)|$)/);\n  const chanMatch = block.match(/Source channels:\\s*(.+)/);\n\n  if (!nameMatch || !typeMatch || !bodyMatch) continue;\n\n  proposals.push({\n    suggested_name: nameMatch[1].trim(),\n    memory_type: typeMatch[1].toLowerCase(),\n    body: bodyMatch[1].trim(),\n    source_channels: chanMatch ? chanMatch[1].split(',').map(s => s.trim()) : ctx.channelsContributing,\n    source_date: ctx.sourceDate\n  });\n}\n\nif (proposals.length === 0) {\n  return [{ json: { skip: true, reason: 'no blocks parsed from output', sourceDate: ctx.sourceDate, rawOutput: output.slice(0, 500) } }];\n}\n\nreturn proposals.map(p => ({ json: p }));"
+      }
+    },
+    {
+      "id": "mc-has-proposals",
+      "name": "Any Proposals?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mc-insert",
+      "name": "Insert Proposal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        100
+      ],
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "__rl": true,
+          "value": "memory",
+          "mode": "list"
+        },
+        "table": {
+          "__rl": true,
+          "value": "consolidation_proposals",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "memory_type": "={{ $json.memory_type }}",
+            "suggested_name": "={{ $json.suggested_name }}",
+            "body": "={{ $json.body }}",
+            "source_channels": "={{ '{' + ($json.source_channels || []).map(c => String(c).replace(/\"/g, '\\\\\"')).join(',') + '}' }}",
+            "source_date": "={{ $json.source_date }}"
+          },
+          "matchingColumns": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "mc-noop-skip",
+      "name": "Skipped",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1780,
+        320
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "mc-noop-empty",
+      "name": "No Messages Yesterday",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        900,
+        420
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Daily 2am": {
+      "main": [
+        [
+          {
+            "node": "Fetch Yesterday's Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Yesterday's Messages": {
+      "main": [
+        [
+          {
+            "node": "Any Messages Yesterday?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Messages Yesterday?": {
+      "main": [
+        [
+          {
+            "node": "Build Consolidation Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Messages Yesterday",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Consolidation Prompt": {
+      "main": [
+        [
+          {
+            "node": "Call Claude Via Relay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Claude Via Relay": {
+      "main": [
+        [
+          {
+            "node": "Parse PROPOSED MEMORY UPDATE Blocks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse PROPOSED MEMORY UPDATE Blocks": {
+      "main": [
+        [
+          {
+            "node": "Any Proposals?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Proposals?": {
+      "main": [
+        [
+          {
+            "node": "Insert Proposal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "id": "workflow-13-consolidation"
+}

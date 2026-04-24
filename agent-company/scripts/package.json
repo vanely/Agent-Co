@@ -1,0 +1,20 @@
+{
+  "name": "agentco-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "pg": "^8.11.3",
+    "nodemailer": "^6.9.9"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.11.0",
+    "@types/nodemailer": "^6.4.14",
+    "typescript": "^5.3.3"
+  }
+}

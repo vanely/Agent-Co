@@ -1,0 +1,640 @@
+{
+  "name": "14 - Message Queue Recovery (Stuck Row Sweep)",
+  "nodes": [
+    {
+      "id": "mq-cron",
+      "name": "Every 5 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/5 * * * *"
+            }
+          ]
+        }
+      },
+      "notes": "Sweeps memory.message_queue for rows stuck in 'received' >2min or 'processing' >3min. Retries via relay; marks stale after 3 attempts or 2 hours (SQL encoded in persistence layer)."
+    },
+    {
+      "id": "mq-fetch-stuck",
+      "name": "Fetch Stuck Messages",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, channel, channel_id, external_id, author, content, attempts FROM memory.message_queue WHERE (status = 'received' AND received_at < NOW() - INTERVAL '2 minutes') OR (status = 'processing' AND locked_at < NOW() - INTERVAL '3 minutes') OR (status = 'failed' AND attempts < 3 AND received_at > NOW() - INTERVAL '2 hours') ORDER BY received_at LIMIT 20",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "mq-has-stuck",
+      "name": "Any Stuck?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $input.all().length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mq-batch",
+      "name": "One At A Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        900,
+        200
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "mq-claim",
+      "name": "Claim (Atomic Mark Processing)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE memory.message_queue SET status = 'processing', locked_at = NOW(), attempts = attempts + 1 WHERE id = '{{ $json.id }}'::uuid AND status IN ('received', 'processing', 'failed') RETURNING id, channel, channel_id, external_id, author, content, attempts",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "mq-relay",
+      "name": "Replay via Relay",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1340,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/run-agent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"task\": {{ JSON.stringify('[replay] ' + ($json.author || 'user') + ' said: ' + ($json.content || '')) }},\n  \"timeoutSeconds\": 180,\n  \"channelId\": {{ JSON.stringify('queue-replay-' + $json.channel + '-' + $json.channel_id) }}\n}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "mq-relay-ok",
+      "name": "Replay Succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.success }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mq-mark-completed",
+      "name": "Mark Completed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2220,
+        140
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE memory.message_queue SET status = 'completed', processed_at = NOW(), locked_at = NULL WHERE id = '{{ $('Claim (Atomic Mark Processing)').item.json.id }}'::uuid",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "mq-mark-failed",
+      "name": "Mark Failed or Stale",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        320
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE memory.message_queue SET status = CASE WHEN attempts >= 3 THEN 'stale' WHEN received_at < NOW() - INTERVAL '2 hours' THEN 'stale' ELSE 'failed' END, last_error = {{ JSON.stringify(String($json.error || 'relay replay failed').slice(0, 2000)) }}, locked_at = NULL WHERE id = '{{ $('Claim (Atomic Mark Processing)').item.json.id }}'::uuid RETURNING status, attempts, channel, channel_id, external_id",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "mq-stale-alert",
+      "name": "Alert on Stale",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        320
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "stale",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mq-telegram-alert",
+      "name": "Alert Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2220,
+        220
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": \"{{ $env.TELEGRAM_CHAT_ID }}\",\n  \"text\": {{ JSON.stringify('\u26a0\ufe0f Queue message went stale after ' + $json.attempts + ' attempts\\nchannel=' + $json.channel + ' channel_id=' + $json.channel_id + '\\nexternal_id=' + $json.external_id) }}\n}",
+        "options": {}
+      }
+    },
+    {
+      "id": "mq-loop-back",
+      "name": "Loop Back",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2220,
+        420
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "mq-noop-empty",
+      "name": "Nothing Stuck",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        900,
+        420
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "mq-switch-channel",
+      "name": "Route By Channel",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1780,
+        100
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Claim (Atomic Mark Processing)').item.json.channel }}",
+                    "rightValue": "discord",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "discord"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Claim (Atomic Mark Processing)').item.json.channel }}",
+                    "rightValue": "telegram",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "telegram"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      }
+    },
+    {
+      "id": "mq-deliver-discord",
+      "name": "Deliver to Discord",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2000,
+        40
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://discord.com/api/v10/channels/{{ $('Claim (Atomic Mark Processing)').item.json.channel_id }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bot {{ $env.DISCORD_BOT_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"content\": {{ JSON.stringify('[replay] ' + String($json.output || '(empty)').slice(0, 1900)) }}\n}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "mq-deliver-telegram",
+      "name": "Deliver to Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2000,
+        140
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": {{ JSON.stringify(String($('Claim (Atomic Mark Processing)').item.json.channel_id)) }},\n  \"text\": {{ JSON.stringify('[replay] ' + String($json.output || '(empty)').slice(0, 3800)) }}\n}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "mq-deliver-cli-noop",
+      "name": "CLI: No Delivery Needed",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2000,
+        240
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Every 5 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Fetch Stuck Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Stuck Messages": {
+      "main": [
+        [
+          {
+            "node": "Any Stuck?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Stuck?": {
+      "main": [
+        [
+          {
+            "node": "One At A Time",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nothing Stuck",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One At A Time": {
+      "main": [
+        [
+          {
+            "node": "Claim (Atomic Mark Processing)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim (Atomic Mark Processing)": {
+      "main": [
+        [
+          {
+            "node": "Replay via Relay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replay via Relay": {
+      "main": [
+        [
+          {
+            "node": "Replay Succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replay Succeeded?": {
+      "main": [
+        [
+          {
+            "node": "Route By Channel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Failed or Stale",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Failed or Stale": {
+      "main": [
+        [
+          {
+            "node": "Alert on Stale",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert on Stale": {
+      "main": [
+        [
+          {
+            "node": "Alert Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Completed": {
+      "main": [
+        [
+          {
+            "node": "Loop Back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Telegram": {
+      "main": [
+        [
+          {
+            "node": "Loop Back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Back": {
+      "main": [
+        [
+          {
+            "node": "One At A Time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route By Channel": {
+      "main": [
+        [
+          {
+            "node": "Deliver to Discord",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Deliver to Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "CLI: No Delivery Needed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deliver to Discord": {
+      "main": [
+        [
+          {
+            "node": "Mark Completed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deliver to Telegram": {
+      "main": [
+        [
+          {
+            "node": "Mark Completed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CLI: No Delivery Needed": {
+      "main": [
+        [
+          {
+            "node": "Mark Completed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "id": "workflow-14-queue-recovery"
+}

@@ -1,0 +1,272 @@
+{
+  "name": "07 - Email Dispatch",
+  "nodes": [
+    {
+      "id": "schedule",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9,14 * * 1-5"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "daily-count",
+      "name": "Check Daily Send Count",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COUNT(*)::int AS sent_today FROM outreach.emails WHERE status = 'sent' AND DATE(sent_at) = CURRENT_DATE",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "under-limit",
+      "name": "Under Daily Limit?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.sent_today }}",
+              "rightValue": 100,
+              "operator": {
+                "type": "number",
+                "operation": "lt"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "limit-reached",
+      "name": "Daily Limit Reached",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        900,
+        420
+      ],
+      "parameters": {
+        "errorMessage": "Daily email send limit of 100 reached."
+      }
+    },
+    {
+      "id": "get-pending",
+      "name": "Get Pending Emails",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        900,
+        220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT e.id, e.lead_id, e.to_email, e.subject, e.body, c.business_name, c.owner_name FROM outreach.emails e JOIN leads.contacts c ON e.lead_id = c.id WHERE e.status = 'pending' ORDER BY e.created_at ASC LIMIT {{ {{ $env.EMAIL_DAILY_CAP }} - $('Check Daily Send Count').item.json.sent_today }}",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "batch-send",
+      "name": "Batch By 10",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1120,
+        220
+      ],
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      }
+    },
+    {
+      "id": "send-email",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        220
+      ],
+      "parameters": {
+        "fromEmail": "={{ $env.SMTP_USER }}",
+        "toEmail": "={{ $json.to_email }}",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.body }}",
+        "options": {}
+      },
+      "credentials": {
+        "smtp": {
+          "id": "smtp-main",
+          "name": "AgentCo SMTP"
+        }
+      }
+    },
+    {
+      "id": "rate-limit",
+      "name": "Wait 30s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        220
+      ],
+      "parameters": {
+        "amount": "={{ $env.EMAIL_BATCH_WAIT_SECONDS || 30 }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "mark-sent",
+      "name": "Mark Sent In DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE outreach.emails SET status = 'sent', sent_at = NOW() WHERE id = '{{ $json.id }}'::uuid;\nUPDATE leads.contacts SET status = 'contacted', updated_at = NOW() WHERE id = '{{ $json.lead_id }}'::uuid;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Check Daily Send Count",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Daily Send Count": {
+      "main": [
+        [
+          {
+            "node": "Under Daily Limit?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Under Daily Limit?": {
+      "main": [
+        [
+          {
+            "node": "Get Pending Emails",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Daily Limit Reached",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Pending Emails": {
+      "main": [
+        [
+          {
+            "node": "Batch By 10",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch By 10": {
+      "main": [
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email": {
+      "main": [
+        [
+          {
+            "node": "Wait 30s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 30s": {
+      "main": [
+        [
+          {
+            "node": "Mark Sent In DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "nHzJlPJf4qiWlWNC"
+  },
+  "staticData": null,
+  "id": "hvNc41joUjhAPoeN"
+}

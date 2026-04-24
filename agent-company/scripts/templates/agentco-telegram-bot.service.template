@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Company — Telegram Bot (Agent Co)
+After=network.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory={{PROJECT_DIR}}/telegram-bot
+EnvironmentFile={{PROJECT_DIR}}/.env
+ExecStart=/usr/bin/npx tsx src/bot.ts
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:{{PROJECT_DIR}}/telegram-bot/bot.log
+StandardError=append:{{PROJECT_DIR}}/telegram-bot/bot.log
+
+[Install]
+WantedBy=default.target

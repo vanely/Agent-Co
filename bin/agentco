@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+# agentco — top-level CLI for the Agent Co fleet.
+#
+# Subcommands wrap the most common operations into one binary.
+# Run `agentco help` for the full list.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+AGENT_CO_ROOT="${AGENT_CO_ROOT:-$(dirname "$SCRIPT_DIR")}"
+export AGENT_CO_ROOT
+
+if [ -t 1 ]; then
+  C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+  C_CYAN='\033[36m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_RED='\033[31m'
+else
+  C_RESET=''; C_BOLD=''; C_DIM=''; C_CYAN=''; C_GREEN=''; C_YELLOW=''; C_RED=''
+fi
+
+ok()   { printf "${C_GREEN}✓${C_RESET} %s\n" "$1"; }
+warn() { printf "${C_YELLOW}!${C_RESET} %s\n" "$1"; }
+err()  { printf "${C_RED}✗${C_RESET} %s\n" "$1"; }
+
+load_relay_token() {
+  local env_file="$AGENT_CO_ROOT/agent-company/.env"
+  [ -f "$env_file" ] || return 1
+  grep '^RELAY_SECRET=' "$env_file" | head -1 | cut -d= -f2-
+}
+
+RELAY_URL="${AGENTCO_RELAY_URL:-http://localhost:3456}"
+
+cmd_usage() {
+  cat <<EOF
+${C_BOLD}agentco${C_RESET} — Agent Co CLI
+
+Usage: agentco <command> [args]
+
+${C_BOLD}Setup + system${C_RESET}
+  setup [--check|--yes]    Run first-run wizard (or verify existing install)
+  status                   Show fleet health + running services
+  health                   Quick curl to relay /health
+  logs <service>           Tail logs for relay|bot|telegram|all
+  mcp                      Run the MCP server (stdio — not meant for humans)
+
+${C_BOLD}Skills + learning${C_RESET}
+  skills list              Show registered skill library
+  skills contributions     Show pending skill contribution proposals
+  learning pending         Show unprocessed learning-journal entries
+  learning consolidate     Force consolidation run
+
+${C_BOLD}Broadcast${C_RESET}
+  notify discord <msg>     Post to Discord (requires bot configured)
+  notify telegram <msg>    Post to Telegram (requires bot configured)
+  notify all <msg>         Post to both
+
+${C_BOLD}Tools${C_RESET}
+  scrape <source> [args]   Lead scraping (google-maps|linkedin|yelp — TBD)
+  tunnel start [port]      Start a tunnel (cloudflared/ngrok auto-detect)
+  tunnel stop              Stop the active tunnel
+  browser-pin <action>     Pin the browser-harness clone version (status|check|pin|upgrade)
+  cc-pin <action>          Pin Claude Code version (check|bless|last)
+  session <action>         Claude Code session export/import (list|export|import)
+
+${C_BOLD}DB / backup${C_RESET}
+  db shell                 psql into Postgres
+  db backup                Trigger a full backup
+  db migrations            Show recent schema-related rows
+
+${C_BOLD}Dev${C_RESET}
+  up                       Start Docker services
+  down                     Stop Docker services
+  rebuild                  Rebuild relay + MCP server + restart
+
+Run with no args to see this help.
+EOF
+}
+
+relay_call() {
+  local method="$1" path="$2" body="${3:-}"
+  local token
+  token="$(load_relay_token 2>/dev/null || echo '')"
+  local auth=()
+  [ -n "$token" ] && auth=(-H "Authorization: Bearer $token")
+
+  if [ -n "$body" ]; then
+    curl -sS -X "$method" "$RELAY_URL$path" \
+      -H "Content-Type: application/json" \
+      "${auth[@]}" \
+      -d "$body"
+  else
+    curl -sS -X "$method" "$RELAY_URL$path" "${auth[@]}"
+  fi
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+do_status() {
+  printf "${C_BOLD}Agent Co status${C_RESET}\n\n"
+  printf "Install root: ${C_DIM}%s${C_RESET}\n\n" "$AGENT_CO_ROOT"
+
+  # Docker containers
+  printf "${C_BOLD}Docker${C_RESET}\n"
+  if command -v docker >/dev/null 2>&1; then
+    docker ps --filter 'name=agentco_' --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null \
+      | head -10 || warn "docker ps failed"
+  else
+    warn "docker not found"
+  fi
+
+  echo ""
+  printf "${C_BOLD}Relay${C_RESET}\n"
+  if curl -sS -m 2 "$RELAY_URL/health" >/dev/null 2>&1; then
+    relay_call GET /health | python3 -c "import json,sys; d=json.load(sys.stdin); print(f\"  status: {d.get('status')}  port: {d.get('port')}  auth: {d.get('auth')}  sessions: {d.get('sessions')}\")"
+  else
+    err "relay not responding on $RELAY_URL"
+  fi
+
+  echo ""
+  printf "${C_BOLD}Services${C_RESET}\n"
+  case "$(uname -s)" in
+    Linux*)
+      systemctl --user list-units --all 'agentco-*' --no-legend --no-pager 2>/dev/null \
+        | awk '{printf "  %-45s %-10s %s\n", $1, $3, $4}' | head -15 || warn "no user services found"
+      ;;
+    Darwin*)
+      launchctl list | grep -E 'com\.agentco' | head -10 || warn "no agents loaded"
+      ;;
+  esac
+}
+
+do_health() {
+  relay_call GET /health | python3 -m json.tool 2>/dev/null || relay_call GET /health
+}
+
+do_logs() {
+  local svc="${1:-all}"
+  case "$svc" in
+    relay)     tail -f "$AGENT_CO_ROOT/agent-company/relay/relay.log" 2>/dev/null ;;
+    bot|discord) tail -f "$AGENT_CO_ROOT/agent-company/discord-bot/bot.log" 2>/dev/null ;;
+    telegram)  tail -f "$AGENT_CO_ROOT/agent-company/telegram-bot/bot.log" 2>/dev/null ;;
+    all)       tail -f "$AGENT_CO_ROOT/agent-company"/*/*.log 2>/dev/null ;;
+    *)         err "unknown service: $svc (use: relay|bot|telegram|all)"; exit 2 ;;
+  esac
+}
+
+do_skills_list() {
+  local skills_dir="${SKILL_LIBRARY_ROOT:-$AGENT_CO_ROOT/skills}"
+  if [ ! -d "$skills_dir" ]; then
+    warn "no skills directory at $skills_dir"
+    return
+  fi
+  printf "${C_BOLD}Skills in %s${C_RESET}\n\n" "$skills_dir"
+  for skill in "$skills_dir"/*.md; do
+    [ -f "$skill" ] || continue
+    local name size
+    name=$(basename "$skill" .md)
+    size=$(wc -c < "$skill")
+    printf "  %-30s ${C_DIM}%6d bytes${C_RESET}\n" "$name" "$size"
+  done
+}
+
+do_skills_contributions() {
+  local status="${1:-pending}"
+  relay_call GET "/skill-contributions?status=${status}" | python3 -m json.tool 2>/dev/null || echo "relay unreachable"
+}
+
+do_learning_pending() {
+  relay_call GET /pending-learnings | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(f\"Total pending: {d['total']}\")
+for skill, entries in d.get('grouped', {}).items():
+    print(f\"\n[{skill}] ({len(entries)} entries)\")
+    for e in entries[:5]:
+        print(f\"  {e['signal_pattern']:25} {e['excerpt'][:80]}\")
+" 2>/dev/null || echo "relay unreachable"
+}
+
+do_learning_consolidate() {
+  relay_call POST /consolidate-learnings '{"minPending":1,"force":true}' | python3 -m json.tool 2>/dev/null
+}
+
+do_notify() {
+  local channel="$1" message="$2"
+  local endpoint
+  case "$channel" in
+    discord)  endpoint="/notify-pocket" ;;
+    telegram) endpoint="/notify-telegram" ;;
+    all)
+      do_notify discord "$message"
+      do_notify telegram "$message"
+      return
+      ;;
+    *) err "unknown channel: $channel"; exit 2 ;;
+  esac
+  relay_call POST "$endpoint" "$(printf '{"message":%s}' "$(python3 -c "import json,sys;print(json.dumps(sys.argv[1]))" "$message")")"
+  echo ""
+}
+
+do_tunnel_start() {
+  local port="${1:-3001}"
+  if command -v cloudflared >/dev/null 2>&1; then
+    ok "Starting cloudflared tunnel to localhost:$port"
+    cloudflared tunnel --url "http://localhost:$port" 2>&1 | tee "$AGENT_CO_ROOT/agent-company/scripts/tunnel-url.txt"
+  elif command -v ngrok >/dev/null 2>&1; then
+    ok "Starting ngrok tunnel to localhost:$port"
+    ngrok http "$port"
+  else
+    err "neither cloudflared nor ngrok installed"
+    echo "  install cloudflared: https://pkg.cloudflare.com/index.html"
+    echo "  install ngrok:       https://ngrok.com/download"
+    exit 2
+  fi
+}
+
+do_tunnel_stop() {
+  pkill -f 'cloudflared.*tunnel' 2>/dev/null && ok "stopped cloudflared" || true
+  pkill -f 'ngrok.*http'         2>/dev/null && ok "stopped ngrok"       || true
+}
+
+do_scrape() {
+  local source="${1:-}"
+  shift || true
+
+  local scraper_dir="$AGENT_CO_ROOT/agent-company/scripts/lead-scraper"
+  if [ ! -d "$scraper_dir" ]; then
+    err "lead-scraper directory not found at $scraper_dir"
+    exit 2
+  fi
+
+  case "$source" in
+    google-maps|gmaps)
+      (cd "$scraper_dir" && npx tsx scrape-google-maps.ts "$@")
+      ;;
+    linkedin)
+      (cd "$scraper_dir" && npx tsx scrape-linkedin.ts "$@") 2>/dev/null || warn "linkedin scraper not yet implemented"
+      ;;
+    yelp)
+      (cd "$scraper_dir" && npx tsx scrape-yelp.ts "$@") 2>/dev/null || warn "yelp scraper not yet implemented"
+      ;;
+    list|"")
+      printf "${C_BOLD}Available scrape sources${C_RESET}\n"
+      echo "  google-maps  (alias: gmaps)  — Google Maps business scraper"
+      echo "  linkedin                     — LinkedIn (stub)"
+      echo "  yelp                         — Yelp (stub)"
+      echo ""
+      echo "Usage: agentco scrape <source> [args...]"
+      ;;
+    *)
+      err "unknown scrape source: $source"
+      exit 2
+      ;;
+  esac
+}
+
+do_db_shell() {
+  docker exec -it agentco_postgres psql -U agentco -d agentco
+}
+
+do_db_backup() {
+  relay_call POST /backup-db | python3 -m json.tool 2>/dev/null
+}
+
+do_up() {
+  (cd "$AGENT_CO_ROOT/agent-company" && docker compose up -d)
+}
+
+do_down() {
+  (cd "$AGENT_CO_ROOT/agent-company" && docker compose down)
+}
+
+do_rebuild() {
+  (cd "$AGENT_CO_ROOT/agent-company/relay" && npm run build)
+  (cd "$AGENT_CO_ROOT/agent-company/mcp-server" && npm run build)
+  case "$(uname -s)" in
+    Linux*)
+      systemctl --user restart agentco-relay.service 2>/dev/null && ok "relay restarted"
+      ;;
+    Darwin*)
+      launchctl unload "$HOME/Library/LaunchAgents/com.agentco.relay.plist" 2>/dev/null
+      launchctl load -w "$HOME/Library/LaunchAgents/com.agentco.relay.plist" 2>/dev/null
+      ok "relay reloaded"
+      ;;
+  esac
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  setup)        exec "$SCRIPT_DIR/agentco-setup" "$@" ;;
+  mcp)          exec "$SCRIPT_DIR/agentco-mcp"   "$@" ;;
+  status)       do_status ;;
+  health)       do_health ;;
+  logs)         do_logs "${1:-all}" ;;
+
+  skills)
+    sub="${1:-list}"; shift || true
+    case "$sub" in
+      list)          do_skills_list ;;
+      contributions) do_skills_contributions "$@" ;;
+      *) err "skills subcommand: list|contributions"; exit 2 ;;
+    esac
+    ;;
+
+  learning)
+    sub="${1:-pending}"; shift || true
+    case "$sub" in
+      pending)     do_learning_pending ;;
+      consolidate) do_learning_consolidate ;;
+      *) err "learning subcommand: pending|consolidate"; exit 2 ;;
+    esac
+    ;;
+
+  notify)
+    channel="${1:-}"; shift || true
+    msg="$*"
+    [ -z "$msg" ] && { err "usage: agentco notify <discord|telegram|all> <message>"; exit 2; }
+    do_notify "$channel" "$msg"
+    ;;
+
+  scrape)       do_scrape "$@" ;;
+
+  tunnel)
+    sub="${1:-start}"; shift || true
+    case "$sub" in
+      start) do_tunnel_start "$@" ;;
+      stop)  do_tunnel_stop ;;
+      *) err "tunnel subcommand: start|stop"; exit 2 ;;
+    esac
+    ;;
+
+  browser-pin)
+    exec "$AGENT_CO_ROOT/agent-company/scripts/browser-harness-pin.sh" "$@"
+    ;;
+
+  cc-pin)
+    exec "$AGENT_CO_ROOT/agent-company/scripts/cc-version-check.sh" "$@"
+    ;;
+
+  session)
+    exec "$SCRIPT_DIR/agentco-session" "$@"
+    ;;
+
+  db)
+    sub="${1:-shell}"; shift || true
+    case "$sub" in
+      shell)  do_db_shell ;;
+      backup) do_db_backup ;;
+      *) err "db subcommand: shell|backup"; exit 2 ;;
+    esac
+    ;;
+
+  up)     do_up ;;
+  down)   do_down ;;
+  rebuild) do_rebuild ;;
+
+  help|--help|-h) cmd_usage ;;
+  *)
+    err "unknown command: $cmd"
+    echo ""
+    cmd_usage
+    exit 2
+    ;;
+esac

@@ -1,0 +1,20 @@
+{
+  "name": "@agentco/messaging",
+  "version": "0.1.0",
+  "description": "Platform-agnostic messaging library for agent-co bots. Discord + Telegram adapters share chunking, escaping, reactions, typing, persistence — only inbound/outbound I/O varies.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.6.0"
+  }
+}

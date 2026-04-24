@@ -1,0 +1,264 @@
+{
+  "name": "08 - Follow-up Sequencer",
+  "nodes": [
+    {
+      "id": "schedule",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1-5"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "get-followups",
+      "name": "Get Due Follow-ups",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT e.id AS email_id, e.lead_id, e.subject AS original_subject, e.body AS original_body, e.sequence_step, c.email, c.business_name, c.owner_name FROM outreach.emails e JOIN leads.contacts c ON e.lead_id = c.id WHERE e.status = 'sent' AND e.sequence_step < {{ $env.MAX_FOLLOWUP_STEPS }} AND e.next_followup_at <= NOW() AND c.status NOT IN ('replied', 'converted', 'unsubscribed')",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "check-any",
+      "name": "Any Follow-ups Due?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $input.all().length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "split-one",
+      "name": "One At A Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        900,
+        220
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "build-prompt",
+      "name": "Build Follow-up Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        220
+      ],
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst item = $input.first().json;\n\nconst stepLabels = ['second', 'third', 'final'];\nconst stepLabel = stepLabels[item.sequence_step - 1] ?? 'follow-up';\nconst followUpNumber = item.sequence_step + 1;\n\n// Prompt template lives at agent-company/prompts/follow-up.md\n// (mounted to /prompts inside the n8n container)\nconst template = fs.readFileSync('/prompts/follow-up.md', 'utf-8');\n\nconst prompt = template\n  .replace(/\\{\\{step_label\\}\\}/g, stepLabel)\n  .replace(/\\{\\{business_name\\}\\}/g, item.business_name ?? '')\n  .replace(/\\{\\{original_subject\\}\\}/g, item.original_subject ?? '')\n  .replace(/\\{\\{original_body\\}\\}/g, item.original_body ?? '')\n  .replace(/\\{\\{follow_up_number\\}\\}/g, String(followUpNumber));\n\nreturn [{ json: { prompt, ...item } }];"
+      }
+    },
+    {
+      "id": "call-claude",
+      "name": "Call Claude Via Relay",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1340,
+        220
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/run-agent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"task\": {{ JSON.stringify($json.prompt) }}, \"timeoutSeconds\": 120}",
+        "options": {}
+      }
+    },
+    {
+      "id": "parse-output",
+      "name": "Parse Follow-up Draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        220
+      ],
+      "parameters": {
+        "jsCode": "const result = $input.first().json;\nif (!result.success) throw new Error('Claude error: ' + result.error);\nconst clean = result.output.replace(/^```json\\s*/i,'').replace(/^```\\s*/i,'').replace(/```\\s*$/i,'').trim();\nconst draft = JSON.parse(clean);\nreturn [{ json: { ...draft, lead_id: $('Build Follow-up Prompt').item.json.lead_id, email: $('Build Follow-up Prompt').item.json.email, sequence_step: $('Build Follow-up Prompt').item.json.sequence_step }}];"
+      }
+    },
+    {
+      "id": "insert-followup",
+      "name": "Insert Follow-up Email",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO outreach.emails (lead_id, to_email, subject, body, status, sequence_step, next_followup_at) VALUES ('{{ $json.lead_id }}'::uuid, '{{ $json.email }}', '{{ $json.subject }}', '{{ $json.body }}', 'pending', {{ $json.sequence_step + 1 }}, NOW() + INTERVAL '7 days')",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-main",
+          "name": "AgentCo Postgres"
+        }
+      }
+    },
+    {
+      "id": "no-op",
+      "name": "No Follow-ups Due",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        900,
+        420
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Due Follow-ups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Due Follow-ups": {
+      "main": [
+        [
+          {
+            "node": "Any Follow-ups Due?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Follow-ups Due?": {
+      "main": [
+        [
+          {
+            "node": "One At A Time",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Follow-ups Due",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One At A Time": {
+      "main": [
+        [
+          {
+            "node": "Build Follow-up Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Follow-up Prompt": {
+      "main": [
+        [
+          {
+            "node": "Call Claude Via Relay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Claude Via Relay": {
+      "main": [
+        [
+          {
+            "node": "Parse Follow-up Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Follow-up Draft": {
+      "main": [
+        [
+          {
+            "node": "Insert Follow-up Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "nHzJlPJf4qiWlWNC"
+  },
+  "staticData": null,
+  "id": "Dc057CEDhvIt06hn"
+}

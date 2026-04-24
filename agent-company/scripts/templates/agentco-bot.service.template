@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Company — Discord Bot (agent)
+After=network.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory={{PROJECT_DIR}}/discord-bot
+EnvironmentFile={{PROJECT_DIR}}/.env
+ExecStart=/usr/bin/node dist/bot.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:{{PROJECT_DIR}}/discord-bot/bot.log
+StandardError=append:{{PROJECT_DIR}}/discord-bot/bot.log
+
+[Install]
+WantedBy=default.target

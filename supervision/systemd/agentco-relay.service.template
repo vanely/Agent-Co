@@ -1,0 +1,18 @@
+[Unit]
+Description=Agent Co — Relay Server
+After=network.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory={{AGENT_CO_ROOT}}/agent-company/relay
+EnvironmentFile={{AGENT_CO_ROOT}}/agent-company/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:{{HOME}}/.local/bin
+Environment=AGENT_CO_ROOT={{AGENT_CO_ROOT}}
+ExecStart=/usr/bin/node {{AGENT_CO_ROOT}}/agent-company/relay/dist/server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:{{AGENT_CO_ROOT}}/agent-company/relay/relay.log
+StandardError=append:{{AGENT_CO_ROOT}}/agent-company/relay/relay.log
+
+[Install]
+WantedBy=default.target

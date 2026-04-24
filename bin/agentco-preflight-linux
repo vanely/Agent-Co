@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# agentco-preflight-linux — bootstrap a Linux machine for Agent Co.
+#
+# Detects and installs missing prereqs via the local package manager.
+# Supports apt (Debian/Ubuntu), dnf (Fedora/RHEL), pacman (Arch).
+#
+# Usage:
+#   bin/agentco-preflight-linux              # interactive
+#   bin/agentco-preflight-linux --yes        # install everything non-interactively
+#   bin/agentco-preflight-linux --check      # diagnose only
+
+set -euo pipefail
+
+if [ -t 1 ]; then
+  C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+  C_CYAN='\033[36m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_RED='\033[31m'; C_MAGENTA='\033[35m'
+else
+  C_RESET=''; C_BOLD=''; C_DIM=''; C_CYAN=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_MAGENTA=''
+fi
+
+step()    { printf "${C_CYAN}▸${C_RESET} %s\n" "$1"; }
+ok()      { printf "${C_GREEN}✓${C_RESET} %s\n" "$1"; }
+warn()    { printf "${C_YELLOW}!${C_RESET} %s\n" "$1"; }
+err()     { printf "${C_RED}✗${C_RESET} %s\n" "$1"; }
+heading() { printf "\n${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$1"; printf "${C_DIM}%s${C_RESET}\n" "$(printf '%.0s─' $(seq 1 ${#1}))"; }
+
+MODE="interactive"
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y)   MODE="yes"   ;;
+    --check|-c) MODE="check" ;;
+  esac
+done
+
+if [ "$(uname -s)" != "Linux" ]; then
+  err "This script is Linux-only. Detected: $(uname -s)"
+  exit 2
+fi
+
+# Detect package manager
+if command -v apt-get >/dev/null 2>&1; then
+  PM="apt"
+  PM_INSTALL="sudo apt-get install -y"
+  PM_UPDATE="sudo apt-get update"
+elif command -v dnf >/dev/null 2>&1; then
+  PM="dnf"
+  PM_INSTALL="sudo dnf install -y"
+  PM_UPDATE="sudo dnf check-update || true"
+elif command -v pacman >/dev/null 2>&1; then
+  PM="pacman"
+  PM_INSTALL="sudo pacman -S --noconfirm"
+  PM_UPDATE="sudo pacman -Sy"
+else
+  err "No supported package manager found (need apt / dnf / pacman)"
+  exit 2
+fi
+
+ask_install() {
+  local what="$1"
+  [ "$MODE" = "yes" ] && return 0
+  [ "$MODE" = "check" ] && return 1
+  printf "  Install %s? [Y/n] " "$what"
+  read -r answer
+  [ -z "$answer" ] || [ "$answer" = "y" ] || [ "$answer" = "Y" ]
+}
+
+heading "Agent Co — Linux preflight"
+echo "  Package manager: $PM"
+echo "  Mode: $MODE"
+echo ""
+
+# ── Core tools ────────────────────────────────────────────────────────────────
+heading "Core tools"
+for tool in curl git openssl jq; do
+  if command -v "$tool" >/dev/null 2>&1; then
+    ok "$tool present"
+  else
+    warn "$tool missing"
+    if ask_install "$tool"; then
+      $PM_UPDATE 2>&1 | tail -3
+      case "$PM" in
+        apt) $PM_INSTALL "$tool" 2>&1 | tail -3 ;;
+        dnf) $PM_INSTALL "$tool" 2>&1 | tail -3 ;;
+        pacman) $PM_INSTALL "$tool" 2>&1 | tail -3 ;;
+      esac
+    fi
+  fi
+done
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+heading "Docker"
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  ok "Docker running"
+elif command -v docker >/dev/null 2>&1; then
+  warn "Docker installed but daemon not running (start with: sudo systemctl start docker)"
+else
+  warn "Docker not installed"
+  if ask_install "Docker via get.docker.com"; then
+    step "Running official Docker install..."
+    curl -fsSL https://get.docker.com | sudo sh
+    sudo usermod -aG docker "$USER"
+    warn "Log out + back in for docker group membership to take effect."
+  fi
+fi
+
+# ── Node.js ───────────────────────────────────────────────────────────────────
+heading "Node.js"
+if command -v node >/dev/null 2>&1; then
+  node_major="$(node --version | sed 's/v//' | cut -d. -f1)"
+  if [ "$node_major" -ge 20 ]; then
+    ok "Node $(node --version) (OK, >=20)"
+  else
+    warn "Node $(node --version) too old; need >=20"
+    if ask_install "Node 22 via NodeSource"; then
+      curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+      $PM_INSTALL nodejs 2>&1 | tail -3
+    fi
+  fi
+else
+  warn "Node not installed"
+  if ask_install "Node 22"; then
+    case "$PM" in
+      apt)
+        curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+        $PM_INSTALL nodejs 2>&1 | tail -3
+        ;;
+      dnf|pacman)
+        $PM_INSTALL nodejs npm 2>&1 | tail -3
+        ;;
+    esac
+  fi
+fi
+
+# ── Python ────────────────────────────────────────────────────────────────────
+heading "Python"
+if command -v python3 >/dev/null 2>&1; then
+  py_v="$(python3 --version | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+  py_major="$(echo "$py_v" | cut -d. -f1)"
+  py_minor="$(echo "$py_v" | cut -d. -f2)"
+  if [ "$py_major" -ge 3 ] && [ "$py_minor" -ge 10 ]; then
+    ok "Python $py_v"
+  else
+    warn "Python $py_v too old; need >=3.10"
+    if ask_install "Python 3.12"; then
+      case "$PM" in
+        apt) $PM_INSTALL python3.12 python3-pip 2>&1 | tail -3 ;;
+        dnf) $PM_INSTALL python3.12 python3-pip 2>&1 | tail -3 ;;
+        pacman) $PM_INSTALL python python-pip 2>&1 | tail -3 ;;
+      esac
+    fi
+  fi
+else
+  warn "Python 3 not installed"
+  if ask_install "Python"; then
+    $PM_INSTALL python3 python3-pip 2>&1 | tail -3
+  fi
+fi
+
+# ── Optional: Claude Code CLI ─────────────────────────────────────────────────
+heading "Claude Code CLI (optional)"
+if command -v claude >/dev/null 2>&1; then
+  ok "Claude Code: $(claude --version 2>/dev/null)"
+else
+  warn "Claude Code not installed (skip if using an API-based provider)"
+  echo "  Install: https://docs.claude.com/en/docs/claude-code"
+fi
+
+# ── Optional: Ollama ──────────────────────────────────────────────────────────
+heading "Ollama (optional — fully local LLM)"
+if command -v ollama >/dev/null 2>&1; then
+  ok "Ollama installed"
+else
+  warn "Ollama not installed"
+  if [ "$MODE" = "yes" ] || { [ "$MODE" = "interactive" ] && ask_install "Ollama"; }; then
+    curl -fsSL https://ollama.com/install.sh | sh
+    step "After install: ollama pull llama3.1:8b"
+  fi
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+heading "Summary"
+echo "  Prereqs checked. Next: run bin/agentco-setup to configure your install."
+echo ""

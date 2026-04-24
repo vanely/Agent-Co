@@ -1,0 +1,307 @@
+{
+  "id": "11e2b367-749c-4724-869c-c60d1dcd823c",
+  "name": "10 - Discord Gateway (Classify + Dispatch)",
+  "nodes": [
+    {
+      "id": "webhook",
+      "name": "Discord Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "discord-message",
+        "responseMode": "onReceived",
+        "responseData": "noData",
+        "options": {}
+      },
+      "webhookId": "discord-message-gateway"
+    },
+
+    {
+      "id": "check-relay",
+      "name": "Check Relay Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/health",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "relay-up",
+      "name": "Relay Up?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 300],
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true},
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "ok",
+              "operator": {"type": "string", "operation": "equals"}
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+
+    {
+      "id": "check-session",
+      "name": "Check Session",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/session-check/{{ $('Discord Webhook').item.json.body.channelId }}",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "can-resume",
+      "name": "Can Resume?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300],
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true},
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.canResume }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "equals"}
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+
+    {
+      "id": "build-resume-prompt",
+      "name": "Build Resume Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 200],
+      "parameters": {
+        "jsCode": "const webhookBody = $('Discord Webhook').item.json.body;\nconst message   = (webhookBody.message   || '').trim();\nconst channelId = webhookBody.channelId  || '';\nconst userId    = webhookBody.userId     || '';\nconst username  = webhookBody.username   || 'user';\nconst messageId = webhookBody.messageId  || '';\n\nif (!message) throw new Error('Empty message received from Discord');\n\n// Resume path: send only the raw message — the agent already has context\nreturn [{ json: {\n  enrichedTask:    message,\n  selectedSkills:  [],\n  channelId,\n  userId,\n  username,\n  messageId,\n  originalMessage: message,\n}}];"
+      }
+    },
+
+    {
+      "id": "list-skills",
+      "name": "List Available Skills",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1340, 420],
+      "parameters": {
+        "command": "find /workspace/context -name '*.md' ! -name 'README.md' ! -path '*/core/*' | sort"
+      }
+    },
+
+    {
+      "id": "build-selector-prompt",
+      "name": "Build Selector Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 420],
+      "parameters": {
+        "jsCode": "const webhookBody = $('Discord Webhook').item.json.body;\nconst message   = (webhookBody.message   || '').trim();\nconst channelId = webhookBody.channelId  || '';\nconst userId    = webhookBody.userId     || '';\nconst username  = webhookBody.username   || 'user';\nconst messageId = webhookBody.messageId  || '';\n\nif (!message) throw new Error('Empty message received from Discord');\n\nconst stdout = $input.first().json.stdout || '';\nconst availableSkills = stdout\n  .split('\\n')\n  .map(p => p.trim())\n  .filter(Boolean)\n  .map(p => p.replace('/workspace/', '~/.agent-co/workspace/'));\n\nconst ws = '~/.agent-co/workspace';\nconst coreSkills = [\n  `${ws}/context/core/identity.md`,\n  `${ws}/context/core/co-founder.md`,\n  `${ws}/context/core/problem-solver.md`,\n  `${ws}/context/core/learning-capture.md`,\n  `${ws}/context/core/memory-recall.md`,\n  `${ws}/context/core/technical-awareness.md`,\n  `${ws}/context/core/lead-management.md`,\n  `${ws}/context/core/context-anchor.md`,\n  `${ws}/context/self-build/self-architecture.md`,\n  `${ws}/memory/decisions.md`,\n];\n\nconst technicalGuides = [\n  `${ws}/context/technical-guides/backend-guide.md`,\n  `${ws}/context/technical-guides/code-patterns-guide.md`,\n  `${ws}/context/technical-guides/frontend-guide.md`,\n  `${ws}/context/technical-guides/infrastructure-guide.md`,\n  `${ws}/context/technical-guides/seo-playbook.md`,\n  `${ws}/context/technical-guides/stateful-systems-guide.md`,\n  `${ws}/context/design/ui-design-guide.md`,\n];\n\nconst skillList = availableSkills.length\n  ? availableSkills.map(p => `- ${p}`).join('\\n')\n  : '(none available)';\n\nconst selectorPrompt = `You are selecting which skill/context files to load before working on a task.\n\nCore files are always loaded — do not include them in your selection:\n${coreSkills.map(p => `- ${p}`).join('\\n')}\n\nAvailable domain skills:\n${skillList}\n\nSKILL BUNDLES — load these as complete groups when the condition is met:\n\n**Technical bundle** (load ALL of these when the task involves code analysis, debugging, coding, technical research, architecture, infrastructure, refactoring, reviewing code, building features, fixing bugs, or any software engineering work):\n${technicalGuides.map(p => `- ${p}`).join('\\n')}\n\n**Delegation bundle** (load these when the task is non-trivial and would benefit from the agent delegating to specialized employee agents — research, coding, debugging, writing, analysis, multi-step work):\n- ${ws}/context/self-build/delegation.md\n- ${ws}/context/self-build/agents/employees/REGISTRY.md\n- ${ws}/context/agent-co-architecture.md\n\nTask: \"${message}\"\n\nSelect every skill file that would meaningfully improve your work on this task.\nThink beyond what is explicitly stated — for example:\n- Building any website or client-facing page implies SEO matters even if not mentioned\n- Lead research implies knowing the outreach approach and email patterns\n- Any frontend build implies design context is relevant (ui-design-guide.md is part of the technical bundle)\n- Any code analysis, coding, debugging, technical research, or engineering task should load the ENTIRE technical bundle above — do not cherry-pick individual guides from it\n\nReturn ONLY a valid JSON array of the full file paths you want loaded.\nNo explanation, no markdown, no code fences.\nIf no domain skills are relevant, return: []`;\n\nreturn [{ json: {\n  selectorPrompt,\n  availableSkills,\n  coreSkills,\n  technicalGuides,\n  message,\n  channelId,\n  userId,\n  username,\n  messageId,\n}}];"
+      }
+    },
+
+    {
+      "id": "call-selector",
+      "name": "Call Skill Selector",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 420],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/run-agent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{"name": "Content-Type", "value": "application/json"}]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"task\": {{ JSON.stringify($json.selectorPrompt) }},\n  \"timeoutSeconds\": 60\n}",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "build-full-prompt",
+      "name": "Build Full Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 420],
+      "parameters": {
+        "jsCode": "const relayResult   = $input.first().json;\nconst selectorData  = $('Build Selector Prompt').item.json;\n\nlet selectedSkills = [];\nif (relayResult.success && relayResult.output) {\n  try {\n    const clean = relayResult.output\n      .replace(/```json\\s*/gi, '')\n      .replace(/```\\s*/gi, '')\n      .trim();\n    const parsed = JSON.parse(clean);\n    if (Array.isArray(parsed)) selectedSkills = parsed;\n  } catch (e) {\n    // Parsing failed — proceed with core skills only\n  }\n}\n\nconst available = new Set(selectorData.availableSkills);\nlet validSkills = selectedSkills.filter(p => available.has(p));\n\nconst techGuides = selectorData.technicalGuides || [];\nconst hasTechGuide = validSkills.some(p => p.includes('/technical-guides/') || p.includes('/design/'));\nif (hasTechGuide && techGuides.length > 0) {\n  const nonTech = validSkills.filter(p => !p.includes('/technical-guides/') && !p.includes('/design/'));\n  validSkills = [...nonTech, ...techGuides.filter(p => available.has(p))];\n}\n\nconst ws = '~/.agent-co/workspace';\nconst hasDelegation = validSkills.some(p => p.includes('delegation.md'));\nif (hasDelegation) {\n  const delegationExtras = [\n    `${ws}/context/self-build/agents/employees/REGISTRY.md`,\n    `${ws}/context/agent-co-architecture.md`,\n  ];\n  for (const p of delegationExtras) {\n    if (available.has(p) && !validSkills.includes(p)) validSkills.push(p);\n  }\n}\n\nvalidSkills = [...new Set(validSkills)];\n\nconst readList = validSkills.map(p => `  - ${p}`).join('\\n');\n\nconst enrichedTask = validSkills.length > 0 ? [\n  'Load these domain skill files for this task:',\n  readList,\n  '',\n  '---',\n  `Request from ${selectorData.username}:`,\n  selectorData.message,\n].join('\\n') : `Request from ${selectorData.username}:\\n${selectorData.message}`;\n\nreturn [{ json: {\n  enrichedTask,\n  selectedSkills:  validSkills,\n  channelId:       selectorData.channelId,\n  userId:          selectorData.userId,\n  username:        selectorData.username,\n  messageId:       selectorData.messageId,\n  originalMessage: selectorData.message,\n}}];"
+      }
+    },
+
+    {
+      "id": "call-claude",
+      "name": "Call Claude Via Relay",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2220, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/run-agent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{"name": "Content-Type", "value": "application/json"}]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"task\": {{ JSON.stringify($json.enrichedTask) }},\n  \"timeoutSeconds\": 600,\n  \"channelId\": \"{{ $json.channelId }}\",\n  \"username\": \"{{ $json.username }}\",\n  \"originalMessage\": {{ JSON.stringify($json.originalMessage) }},\n  \"discordMsgId\": \"{{ $json.messageId }}\"\n}",
+        "options": {
+          "timeout": 660000
+        }
+      }
+    },
+
+    {
+      "id": "post-discord-reply",
+      "name": "Post Discord Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2440, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/discord-send",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Content-Type",  "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"channelId\": \"{{ $('Discord Webhook').item.json.body.channelId }}\",\n  \"content\": {{ JSON.stringify(($json.sessionFallback ? '> _Session expired, restored from transcript._\\n\\n' : '') + ($json.success ? $json.output : '⚠️ ' + $json.error)) }},\n  \"botToken\": \"{{ $env.DISCORD_BOT_TOKEN }}\",\n  \"replyToMessageId\": \"{{ $('Discord Webhook').item.json.body.messageId }}\"\n}",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "report-execution",
+      "name": "Report Execution",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 300],
+      "parameters": {
+        "jsCode": "const webhook = $('Discord Webhook').item.json;\nconst body = webhook.body || {};\nconst channelId = body.channelId || '';\nconst username = body.username || '';\nconst message = body.message || '';\n\n// Collect node results from the execution\nconst nodeNames = ['Check Relay Health', 'Relay Up?', 'Check Session', 'Can Resume?'];\nconst nodes = [];\n\nfor (const name of nodeNames) {\n  try {\n    const item = $(name).item;\n    nodes.push({ name, type: 'check', status: 'success', outputPreview: JSON.stringify(item.json).slice(0, 200) });\n  } catch {\n    // Node didn't execute in this path — skip\n  }\n}\n\n// Check which path was taken\nlet path = 'unknown';\ntry {\n  $('Build Resume Prompt').item;\n  path = 'resume';\n  nodes.push({ name: 'Build Resume Prompt', type: 'code', status: 'success' });\n} catch {\n  try {\n    $('Build Full Prompt').item;\n    path = 'selector';\n    nodes.push({ name: 'List Available Skills', type: 'command', status: 'success' });\n    nodes.push({ name: 'Build Selector Prompt', type: 'code', status: 'success' });\n    nodes.push({ name: 'Call Skill Selector', type: 'http', status: 'success' });\n    nodes.push({ name: 'Build Full Prompt', type: 'code', status: 'success' });\n  } catch { /* neither path */ }\n}\n\n// Claude relay result\nconst relayResult = $('Call Claude Via Relay').item.json;\nnodes.push({\n  name: 'Call Claude Via Relay',\n  type: 'http',\n  status: relayResult.success ? 'success' : 'error',\n  durationMs: relayResult.durationMs,\n  outputPreview: (relayResult.output || '').slice(0, 200),\n  error: relayResult.success ? undefined : relayResult.error,\n});\n\n// Discord reply\ntry {\n  const discordResult = $('Post Discord Reply').item.json;\n  nodes.push({\n    name: 'Post Discord Reply',\n    type: 'http',\n    status: discordResult.success ? 'success' : 'error',\n    error: discordResult.success ? undefined : discordResult.error,\n  });\n} catch (e) {\n  nodes.push({ name: 'Post Discord Reply', type: 'http', status: 'error', error: String(e).slice(0, 200) });\n}\n\nreturn [{ json: {\n  workflowName: '10-discord-gateway',\n  executionId: $execution.id,\n  status: 'success',\n  traceId: relayResult.traceId || null,\n  path,\n  channelId,\n  username,\n  durationMs: relayResult.durationMs,\n  nodes,\n  message: message.slice(0, 100),\n  resumed: relayResult.sessionResumed || false,\n}}];"
+      }
+    },
+
+    {
+      "id": "send-workflow-event",
+      "name": "Send Workflow Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2880, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CLAUDE_RELAY_URL }}/workflow-event",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{"name": "Content-Type", "value": "application/json"}]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "post-discord-error",
+      "name": "Post Relay Down Error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 520],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://discord.com/api/v10/channels/{{ $('Discord Webhook').item.json.body.channelId }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Authorization", "value": "=Bot {{ $env.DISCORD_BOT_TOKEN }}"},
+            {"name": "Content-Type",  "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"content\": \"⚠️ The Claude relay is offline. Run `make relay-bg` on the host to start it.\",\n  \"message_reference\": {\n    \"message_id\": \"{{ $('Discord Webhook').item.json.body.messageId }}\",\n    \"fail_if_not_exists\": false\n  }\n}",
+        "options": {}
+      }
+    }
+  ],
+
+  "connections": {
+    "Discord Webhook": {
+      "main": [[{"node": "Check Relay Health", "type": "main", "index": 0}]]
+    },
+    "Check Relay Health": {
+      "main": [[{"node": "Relay Up?", "type": "main", "index": 0}]]
+    },
+    "Relay Up?": {
+      "main": [
+        [{"node": "Check Session", "type": "main", "index": 0}],
+        [{"node": "Post Relay Down Error", "type": "main", "index": 0}]
+      ]
+    },
+    "Check Session": {
+      "main": [[{"node": "Can Resume?", "type": "main", "index": 0}]]
+    },
+    "Can Resume?": {
+      "main": [
+        [{"node": "Build Resume Prompt", "type": "main", "index": 0}],
+        [{"node": "List Available Skills", "type": "main", "index": 0}]
+      ]
+    },
+    "Build Resume Prompt": {
+      "main": [[{"node": "Call Claude Via Relay", "type": "main", "index": 0}]]
+    },
+    "List Available Skills": {
+      "main": [[{"node": "Build Selector Prompt", "type": "main", "index": 0}]]
+    },
+    "Build Selector Prompt": {
+      "main": [[{"node": "Call Skill Selector", "type": "main", "index": 0}]]
+    },
+    "Call Skill Selector": {
+      "main": [[{"node": "Build Full Prompt", "type": "main", "index": 0}]]
+    },
+    "Build Full Prompt": {
+      "main": [[{"node": "Call Claude Via Relay", "type": "main", "index": 0}]]
+    },
+    "Call Claude Via Relay": {
+      "main": [[{"node": "Post Discord Reply", "type": "main", "index": 0}]]
+    },
+    "Post Discord Reply": {
+      "main": [[{"node": "Report Execution", "type": "main", "index": 0}]]
+    },
+    "Report Execution": {
+      "main": [[{"node": "Send Workflow Event", "type": "main", "index": 0}]]
+    }
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "nHzJlPJf4qiWlWNC"
+  },
+  "staticData": null
+}

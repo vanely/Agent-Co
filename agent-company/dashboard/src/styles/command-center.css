@@ -1,0 +1,208 @@
+/* ================================================================
+   Agent Company — Command Center Theme
+   Deep dark, sci-fi glow, dense data layout
+   ================================================================ */
+
+:root {
+  --cc-bg-deep: #0a0e14;
+  --cc-bg-panel: #0d1117;
+  --cc-bg-elevated: #131920;
+  --cc-border: rgba(255, 255, 255, 0.06);
+  --cc-border-accent: rgba(var(--mantine-color-primary-6-rgb, 0, 200, 200), 0.2);
+  --cc-glow: rgba(var(--mantine-color-primary-6-rgb, 0, 200, 200), 0.15);
+  --cc-text-primary: #e6edf3;
+  --cc-text-secondary: #7d8590;
+  --cc-text-dim: #484f58;
+  --cc-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Cascadia Code', monospace;
+}
+
+/* Deep dark body */
+body {
+  background: var(--cc-bg-deep) !important;
+  color: var(--cc-text-primary);
+}
+
+/* Override Mantine dark backgrounds */
+.mantine-AppShell-main {
+  background: var(--cc-bg-deep) !important;
+}
+
+.mantine-AppShell-header {
+  background: var(--cc-bg-panel) !important;
+  border-bottom: 1px solid var(--cc-border) !important;
+  backdrop-filter: blur(12px);
+}
+
+.mantine-AppShell-navbar {
+  background: var(--cc-bg-panel) !important;
+  border-right: 1px solid var(--cc-border) !important;
+}
+
+/* Panel styling — subtle glow borders */
+.mantine-Paper-root[data-with-border] {
+  background: var(--cc-bg-panel) !important;
+  border: 1px solid var(--cc-border) !important;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.mantine-Paper-root[data-with-border]:hover {
+  border-color: var(--cc-border-accent) !important;
+  box-shadow: 0 0 20px var(--cc-glow), inset 0 0 20px rgba(0, 0, 0, 0.3);
+}
+
+/* NavLink styling */
+.mantine-NavLink-root {
+  border-radius: 6px;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
+.mantine-NavLink-root[data-active] {
+  background: rgba(var(--mantine-color-primary-6-rgb, 0, 200, 200), 0.08) !important;
+  border-left: 2px solid var(--mantine-color-primary-6) !important;
+}
+
+/* Stat values — monospace, slightly glowing */
+.stat-value {
+  font-family: var(--cc-mono);
+  font-weight: 700;
+  font-size: 1.5rem;
+  letter-spacing: -0.02em;
+  text-shadow: 0 0 10px var(--cc-glow);
+}
+
+/* Table styling */
+.mantine-Table-root {
+  font-size: 13px;
+}
+
+.mantine-Table-thead {
+  border-bottom: 1px solid var(--cc-border);
+}
+
+.mantine-Table-th {
+  font-size: 11px !important;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--cc-text-secondary) !important;
+  font-weight: 600;
+}
+
+.mantine-Table-tr {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.mantine-Table-tr:hover {
+  background: rgba(255, 255, 255, 0.02) !important;
+}
+
+/* Badge — subtle glow */
+.mantine-Badge-root {
+  font-family: var(--cc-mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  font-weight: 500;
+}
+
+/* Inputs */
+.mantine-TextInput-input,
+.mantine-PasswordInput-input,
+.mantine-Select-input {
+  background: var(--cc-bg-elevated) !important;
+  border-color: var(--cc-border) !important;
+  font-size: 13px;
+}
+
+.mantine-TextInput-input:focus,
+.mantine-PasswordInput-input:focus,
+.mantine-Select-input:focus {
+  border-color: var(--cc-border-accent) !important;
+  box-shadow: 0 0 8px var(--cc-glow) !important;
+}
+
+/* Modal */
+.mantine-Modal-content {
+  background: var(--cc-bg-panel) !important;
+  border: 1px solid var(--cc-border);
+}
+
+.mantine-Modal-header {
+  background: var(--cc-bg-panel) !important;
+}
+
+/* Ring progress */
+.mantine-RingProgress-root {
+  filter: drop-shadow(0 0 8px var(--cc-glow));
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Code blocks */
+.mantine-Code-root {
+  background: var(--cc-bg-deep) !important;
+  font-family: var(--cc-mono);
+  font-size: 11px;
+}
+
+/* Login page */
+.mantine-Paper-root[data-with-border] .mantine-Button-root {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* Segmented control */
+.mantine-SegmentedControl-root {
+  background: var(--cc-bg-elevated);
+}
+
+/* Recharts overrides for glow effect */
+.recharts-line .recharts-curve {
+  filter: drop-shadow(0 0 4px var(--cc-glow));
+}
+
+.recharts-cartesian-grid line {
+  stroke: rgba(255, 255, 255, 0.04) !important;
+}
+
+/* Dense grid utility */
+.cc-dense {
+  gap: 8px !important;
+}
+
+/* Pulse animation for live indicators */
+@keyframes cc-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.cc-live {
+  animation: cc-pulse 2s ease-in-out infinite;
+}
+
+/* Color swatch glow on settings page */
+.mantine-ColorSwatch-root {
+  transition: box-shadow 0.2s ease;
+}
+
+.mantine-ColorSwatch-root:hover {
+  box-shadow: 0 0 12px currentColor;
+}

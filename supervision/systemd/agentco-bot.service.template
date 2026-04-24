@@ -1,0 +1,19 @@
+[Unit]
+Description=Agent Co — Discord Bot
+After=network.target docker.service agentco-relay.service
+Wants=agentco-relay.service
+
+[Service]
+Type=simple
+WorkingDirectory={{AGENT_CO_ROOT}}/agent-company/discord-bot
+EnvironmentFile={{AGENT_CO_ROOT}}/agent-company/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:{{HOME}}/.local/bin
+Environment=AGENT_CO_ROOT={{AGENT_CO_ROOT}}
+ExecStart=/usr/bin/npx tsx src/bot.ts
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:{{AGENT_CO_ROOT}}/agent-company/discord-bot/bot.log
+StandardError=append:{{AGENT_CO_ROOT}}/agent-company/discord-bot/bot.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# agentco-preflight-macos — bootstrap a fresh macOS machine for Agent Co.
+#
+# macOS ships with outdated Bash 3.2 and often lacks Docker, Xcode CLT, and
+# modern Node/Python. This script detects what's missing and installs via
+# Homebrew. Safe to run repeatedly; skips anything already installed.
+#
+# Usage:
+#   bin/agentco-preflight-macos            # interactive
+#   bin/agentco-preflight-macos --yes      # install everything without prompting
+#   bin/agentco-preflight-macos --check    # diagnose only, don't install
+
+set -euo pipefail
+
+if [ -t 1 ]; then
+  C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+  C_CYAN='\033[36m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_RED='\033[31m'; C_MAGENTA='\033[35m'
+else
+  C_RESET=''; C_BOLD=''; C_DIM=''; C_CYAN=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_MAGENTA=''
+fi
+
+step()    { printf "${C_CYAN}▸${C_RESET} %s\n" "$1"; }
+ok()      { printf "${C_GREEN}✓${C_RESET} %s\n" "$1"; }
+warn()    { printf "${C_YELLOW}!${C_RESET} %s\n" "$1"; }
+err()     { printf "${C_RED}✗${C_RESET} %s\n" "$1"; }
+heading() { printf "\n${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$1"; printf "${C_DIM}%s${C_RESET}\n" "$(printf '%.0s─' $(seq 1 ${#1}))"; }
+
+MODE="interactive"
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y)   MODE="yes"   ;;
+    --check|-c) MODE="check" ;;
+    --help|-h)
+      cat <<EOF
+Usage: agentco-preflight-macos [--yes|--check]
+
+Checks for (and optionally installs) macOS prerequisites:
+  - Homebrew
+  - Xcode Command Line Tools
+  - Modern Bash (brew install bash)
+  - Docker Desktop
+  - Node.js 20+ (via nvm or brew)
+  - Python 3.10+ (via brew)
+  - jq, curl, openssl
+
+EOF
+      exit 0
+      ;;
+  esac
+done
+
+# Sanity: only run on macOS
+if [ "$(uname -s)" != "Darwin" ]; then
+  err "This script is macOS-only. Detected: $(uname -s)"
+  exit 2
+fi
+
+ask_install() {
+  local what="$1"
+  if [ "$MODE" = "yes" ]; then return 0; fi
+  if [ "$MODE" = "check" ]; then return 1; fi
+  printf "  Install %s? [Y/n] " "$what"
+  read -r answer
+  [ -z "$answer" ] || [ "$answer" = "y" ] || [ "$answer" = "Y" ]
+}
+
+# ── Header ────────────────────────────────────────────────────────────────────
+heading "Agent Co — macOS preflight"
+echo "  Mode: $MODE"
+echo "  (interactive prompts; re-run with --yes to auto-install)"
+echo ""
+
+# ── Xcode Command Line Tools ──────────────────────────────────────────────────
+heading "Xcode Command Line Tools"
+if xcode-select -p &>/dev/null; then
+  ok "Xcode Command Line Tools installed at $(xcode-select -p)"
+else
+  warn "Xcode Command Line Tools missing"
+  if ask_install "Xcode CLT (opens a GUI installer)"; then
+    xcode-select --install
+    warn "Installer window opened. Finish the install, then re-run this script."
+    exit 1
+  fi
+fi
+
+# ── Homebrew ──────────────────────────────────────────────────────────────────
+heading "Homebrew"
+if command -v brew >/dev/null 2>&1; then
+  ok "Homebrew installed: $(brew --version | head -1)"
+else
+  warn "Homebrew missing"
+  if ask_install "Homebrew (curl install script)"; then
+    step "Installing Homebrew..."
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    # Brew on Apple Silicon lives at /opt/homebrew; ensure it's on PATH
+    if [ -d /opt/homebrew/bin ] && [[ ":$PATH:" != *":/opt/homebrew/bin:"* ]]; then
+      export PATH="/opt/homebrew/bin:$PATH"
+    fi
+  else
+    err "Homebrew required — cannot continue without it."
+    exit 2
+  fi
+fi
+
+# ── Modern Bash (macOS ships with 3.2 which is stuck there forever by Apple) ──
+# Homebrew installs a real modern bash. We then:
+#   1. Add its path to /etc/shells (required before chsh accepts it)
+#   2. chsh -s it as the user's default login shell
+#   3. Verify by checking the bash version of a new login shell
+#
+# macOS's /bin/bash cannot be replaced (SIP-protected); the Homebrew bash lives
+# at /opt/homebrew/bin/bash (Apple Silicon) or /usr/local/bin/bash (Intel).
+heading "Modern Bash (macOS ships 3.2 — we need >=5.x)"
+
+brew_prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+brew_bash="$brew_prefix/bin/bash"
+
+# Step 1: install modern bash via Homebrew if missing or too old
+brew_installed_version=""
+if [ -x "$brew_bash" ]; then
+  brew_installed_version="$("$brew_bash" --version | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+fi
+
+need_install=false
+if [ ! -x "$brew_bash" ]; then
+  need_install=true
+elif [ -n "$brew_installed_version" ]; then
+  major="$(echo "$brew_installed_version" | cut -d. -f1)"
+  [ "$major" -lt 5 ] && need_install=true
+fi
+
+if $need_install; then
+  warn "Homebrew bash not installed (or too old). macOS default /bin/bash is 3.2 and cannot be upgraded."
+  if ask_install "modern Bash via Homebrew (brew install bash)"; then
+    brew install bash 2>&1 | tail -5
+    brew_installed_version="$("$brew_bash" --version | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+    ok "Installed bash $brew_installed_version at $brew_bash"
+  else
+    warn "Skipping bash upgrade. Some scripts may fail on macOS's 3.2."
+    return 0 2>/dev/null || true
+  fi
+else
+  ok "Homebrew bash $brew_installed_version present at $brew_bash"
+fi
+
+# Step 2: ensure the Homebrew bash path is in /etc/shells so chsh accepts it
+if [ -x "$brew_bash" ]; then
+  if ! grep -qxF "$brew_bash" /etc/shells 2>/dev/null; then
+    warn "$brew_bash is not in /etc/shells yet."
+    if [ "$MODE" = "check" ]; then
+      warn "Run: sudo sh -c 'echo $brew_bash >> /etc/shells'"
+    elif ask_install "add $brew_bash to /etc/shells (needs sudo)"; then
+      echo "$brew_bash" | sudo tee -a /etc/shells >/dev/null
+      ok "Added to /etc/shells"
+    fi
+  else
+    ok "$brew_bash is registered in /etc/shells"
+  fi
+
+  # Step 3: chsh to make it the default login shell
+  current_shell="${SHELL:-}"
+  if [ "$current_shell" = "$brew_bash" ]; then
+    ok "Login shell is already $brew_bash"
+  else
+    warn "Current login shell is $current_shell (not the upgraded bash)."
+    if [ "$MODE" = "check" ]; then
+      warn "Run: chsh -s $brew_bash"
+    elif ask_install "change login shell to $brew_bash via chsh"; then
+      # chsh may prompt for password; that's fine
+      if chsh -s "$brew_bash"; then
+        ok "Login shell set to $brew_bash (takes effect on next login)"
+      else
+        warn "chsh failed. Run manually: chsh -s $brew_bash"
+      fi
+    fi
+  fi
+
+  # Step 4: sanity — is this bash reachable earlier than /bin/bash on PATH?
+  if command -v bash >/dev/null 2>&1; then
+    path_bash="$(command -v bash)"
+    path_bash_version="$(bash --version | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+    if [ "$path_bash" = "$brew_bash" ] || [ "$(dirname "$path_bash")" = "$brew_prefix/bin" ]; then
+      ok "'bash' on PATH resolves to the upgraded version ($path_bash_version)"
+    else
+      warn "'bash' on PATH is $path_bash ($path_bash_version) — may still resolve to macOS's 3.2."
+      warn "Ensure $brew_prefix/bin is earlier in your PATH (check ~/.zshrc / ~/.bash_profile)."
+    fi
+  fi
+fi
+
+# ── Docker Desktop ────────────────────────────────────────────────────────────
+heading "Docker Desktop"
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  ok "Docker running ($(docker --version))"
+elif command -v docker >/dev/null 2>&1; then
+  warn "Docker installed but daemon not running. Open Docker Desktop."
+  if [ "$MODE" != "check" ]; then
+    open -a Docker 2>/dev/null || true
+    warn "Start Docker Desktop, then re-run this script to continue."
+  fi
+else
+  warn "Docker not installed"
+  if ask_install "Docker Desktop (brew install --cask docker)"; then
+    step "Installing Docker Desktop..."
+    brew install --cask docker 2>&1 | tail -5
+    warn "Launch Docker Desktop from Applications to complete setup."
+    open -a Docker 2>/dev/null || true
+  fi
+fi
+
+# ── Node.js ───────────────────────────────────────────────────────────────────
+heading "Node.js"
+if command -v node >/dev/null 2>&1; then
+  node_v="$(node --version | sed 's/v//')"
+  node_major="$(echo "$node_v" | cut -d. -f1)"
+  if [ "$node_major" -ge 20 ]; then
+    ok "Node $node_v (OK, >=20)"
+  else
+    warn "Node $node_v is too old; need >=20"
+    if ask_install "Node 22 via Homebrew"; then
+      brew install node@22 2>&1 | tail -3
+      brew link --overwrite --force node@22 2>&1 | tail -2
+    fi
+  fi
+else
+  warn "Node.js not installed"
+  if ask_install "Node 22 via Homebrew"; then
+    brew install node@22 2>&1 | tail -3
+    brew link --overwrite --force node@22 2>&1 | tail -2
+  fi
+fi
+
+# ── Python 3.10+ ──────────────────────────────────────────────────────────────
+heading "Python"
+if command -v python3 >/dev/null 2>&1; then
+  py_v="$(python3 --version | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+  py_major="$(echo "$py_v" | cut -d. -f1)"
+  py_minor="$(echo "$py_v" | cut -d. -f2)"
+  if [ "$py_major" -ge 3 ] && [ "$py_minor" -ge 10 ]; then
+    ok "Python $py_v (OK, >=3.10)"
+  else
+    warn "Python $py_v too old; need >=3.10"
+    if ask_install "Python 3.12 via Homebrew"; then
+      brew install python@3.12 2>&1 | tail -3
+    fi
+  fi
+else
+  warn "Python 3 not installed"
+  if ask_install "Python 3.12 via Homebrew"; then
+    brew install python@3.12 2>&1 | tail -3
+  fi
+fi
+
+# ── Ancillary tools ───────────────────────────────────────────────────────────
+heading "Ancillary tools"
+for tool in curl openssl jq; do
+  if command -v "$tool" >/dev/null 2>&1; then
+    ok "$tool present"
+  else
+    warn "$tool missing"
+    if ask_install "$tool via Homebrew"; then
+      brew install "$tool" 2>&1 | tail -2
+    fi
+  fi
+done
+
+# ── Optional: Claude Code CLI ─────────────────────────────────────────────────
+heading "Claude Code CLI (optional — needed for LLM_PROVIDER=claude-cli)"
+if command -v claude >/dev/null 2>&1; then
+  ok "Claude Code: $(claude --version 2>/dev/null | head -1)"
+else
+  warn "Claude Code CLI not installed"
+  echo "  Install: follow https://docs.claude.com/en/docs/claude-code"
+  echo "  Or use an API-based LLM_PROVIDER (anthropic-api / openai-api / ollama) to avoid the CLI"
+fi
+
+# ── Optional: Ollama for free local testing ───────────────────────────────────
+heading "Ollama (optional — fully local LLM provider)"
+if command -v ollama >/dev/null 2>&1; then
+  ok "Ollama installed"
+else
+  warn "Ollama not installed (skip if not using LLM_PROVIDER=ollama)"
+  if [ "$MODE" = "yes" ] || { [ "$MODE" = "interactive" ] && ask_install "Ollama via Homebrew"; }; then
+    brew install ollama 2>&1 | tail -3
+    step "After install, run: ollama pull llama3.1:8b"
+  fi
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+heading "Summary"
+echo "  Prereqs checked. Next: run bin/agentco-setup to configure your install."
+echo ""

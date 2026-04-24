@@ -1,0 +1,867 @@
+#!/usr/bin/env bash
+# agentco-setup — first-run setup wizard for Agent Co.
+#
+# Discovers install location, prompts for provider + optional integrations,
+# generates secrets, writes .env, initializes the database, registers the
+# MCP server config, and installs supervision units for this platform.
+#
+# Re-runnable — subsequent runs reconcile missing config without clobbering
+# user-set values. Anything already set in .env is preserved.
+#
+# Usage:
+#   bin/agentco-setup             # full interactive setup
+#   bin/agentco-setup --yes       # non-interactive (uses defaults; exits if
+#                                 # required values are missing)
+#   bin/agentco-setup --check     # verify install without modifying
+
+set -euo pipefail
+
+# ── Resolve install root ──────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+AGENT_CO_ROOT="${AGENT_CO_ROOT:-$(dirname "$SCRIPT_DIR")}"
+export AGENT_CO_ROOT
+
+ENV_FILE="$AGENT_CO_ROOT/agent-company/.env"
+ENV_EXAMPLE="$AGENT_CO_ROOT/agent-company/.env.example"
+MCP_FILE="$AGENT_CO_ROOT/.mcp.json"
+MCP_TEMPLATE="$AGENT_CO_ROOT/.mcp.json.template"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+  C_RESET='\033[0m'
+  C_BOLD='\033[1m'
+  C_DIM='\033[2m'
+  C_CYAN='\033[36m'
+  C_GREEN='\033[32m'
+  C_YELLOW='\033[33m'
+  C_RED='\033[31m'
+  C_MAGENTA='\033[35m'
+else
+  C_RESET=''; C_BOLD=''; C_DIM=''; C_CYAN=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_MAGENTA=''
+fi
+
+# ── ASCII art banner ──────────────────────────────────────────────────────────
+banner() {
+  printf "${C_CYAN}${C_BOLD}"
+  cat <<'EOF'
+
+     █████╗  ██████╗ ███████╗███╗   ██╗████████╗     ██████╗ ██████╗
+    ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝    ██╔════╝██╔═══██╗
+    ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║       ██║     ██║   ██║
+    ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║       ██║     ██║   ██║
+    ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║       ╚██████╗╚██████╔╝
+    ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝        ╚═════╝ ╚═════╝
+
+EOF
+  printf "${C_RESET}${C_DIM}"
+  cat <<'EOF'
+     self-hosted agentic fleet · coordinator + workflows + learning loop
+EOF
+  printf "${C_RESET}\n"
+}
+
+step()     { printf "${C_CYAN}▸${C_RESET} %s\n" "$1"; }
+ok()       { printf "${C_GREEN}✓${C_RESET} %s\n" "$1"; }
+warn()     { printf "${C_YELLOW}!${C_RESET} %s\n" "$1"; }
+err()      { printf "${C_RED}✗${C_RESET} %s\n" "$1"; }
+heading()  { printf "\n${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$1"; printf "${C_DIM}%s${C_RESET}\n" "$(printf '%.0s─' $(seq 1 ${#1}))"; }
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+MODE="interactive"
+LAYERS=()  # specific layers to (re)configure; empty = full setup
+
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y)           MODE="yes"    ;;
+    --check|-c)         MODE="check"  ;;
+    --name)             LAYERS+=("name") ;;
+    --llm)              LAYERS+=("llm") ;;
+    --discord)          LAYERS+=("discord") ;;
+    --telegram)         LAYERS+=("telegram") ;;
+    --supervision)      LAYERS+=("supervision") ;;
+    --hooks)            LAYERS+=("hooks") ;;
+    --db)               LAYERS+=("db") ;;
+    --mcp)              LAYERS+=("mcp") ;;
+    --secrets)          LAYERS+=("secrets") ;;
+    --path)             LAYERS+=("path") ;;
+    --reset)            LAYERS+=("reset") ;;
+    --help|-h)
+      banner
+      cat <<EOF
+Usage: agentco-setup [--yes|--check] [--LAYER ...]
+
+  (no flag)            Interactive full setup wizard
+  --yes                Non-interactive (use defaults; fails if required values missing)
+  --check              Verify install without modifying anything
+
+  Layer flags (configure a specific piece without rerunning the whole wizard):
+  --name               Set / change the instance name (substitutes into SOUL.md)
+  --llm                Reconfigure the LLM provider + API key
+  --discord            Reconfigure Discord bot settings
+  --telegram           Reconfigure Telegram bot settings
+  --supervision        Reinstall platform supervision (systemd / launchd)
+  --hooks              Register / re-register Claude Code hooks
+  --mcp                Regenerate .mcp.json
+  --db                 Regenerate DB password + connection URL
+  --secrets            Regenerate all secrets (WARNING: invalidates n8n credentials)
+  --path               Register bin/ on PATH via your shell config (.zshrc / .bashrc / etc.)
+  --reset              Prompt for confirmation and wipe .env back to template
+
+  Pass multiple layers: --llm --discord --hooks
+
+Detected install root: $AGENT_CO_ROOT
+
+EOF
+      exit 0
+      ;;
+    *) err "unknown flag: $arg"; exit 2 ;;
+  esac
+done
+
+ask() {
+  # ask "Prompt:" "default" [secret]
+  local prompt="$1"
+  local default="${2:-}"
+  local secret="${3:-}"
+
+  if [ "$MODE" = "yes" ]; then
+    echo "$default"
+    return
+  fi
+
+  local suffix=""
+  [ -n "$default" ] && suffix=" ${C_DIM}[$default]${C_RESET}"
+
+  local input
+  if [ -n "$secret" ]; then
+    printf "  %s%s: " "$prompt" "$suffix" >&2
+    read -rs input
+    echo "" >&2
+  else
+    printf "  %s%s: " "$prompt" "$suffix" >&2
+    read -r input
+  fi
+  echo "${input:-$default}"
+}
+
+ask_yn() {
+  local prompt="$1"
+  local default="${2:-n}"
+
+  if [ "$MODE" = "yes" ]; then
+    [ "$default" = "y" ] && echo "y" || echo "n"
+    return
+  fi
+
+  local default_hint="[y/N]"
+  [ "$default" = "y" ] && default_hint="[Y/n]"
+
+  printf "  %s %s " "$prompt" "$default_hint" >&2
+  local input
+  read -r input
+  case "${input:-$default}" in
+    y|Y|yes|YES) echo "y" ;;
+    *) echo "n" ;;
+  esac
+}
+
+gen_secret() {
+  # Generate a URL-safe token. Length in bytes (output is hex, so actual chars = 2x).
+  local bytes="${1:-32}"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex "$bytes"
+  elif [ -r /dev/urandom ]; then
+    head -c "$bytes" /dev/urandom | od -An -tx1 | tr -d ' \n'
+  else
+    err "need openssl or /dev/urandom to generate secrets"
+    exit 2
+  fi
+}
+
+get_env_var() {
+  # Read current value of env var from $ENV_FILE. Empty if not set or file missing.
+  local key="$1"
+  [ -f "$ENV_FILE" ] || { echo ""; return; }
+  grep "^${key}=" "$ENV_FILE" | head -1 | cut -d= -f2- || echo ""
+}
+
+set_env_var() {
+  local key="$1" val="$2"
+  # Escape special chars for sed
+  local esc
+  esc=$(printf '%s' "$val" | sed -e 's/[\/&|]/\\&/g')
+
+  if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+    sed -i.bak "s|^${key}=.*|${key}=${esc}|" "$ENV_FILE"
+    rm -f "${ENV_FILE}.bak"
+  else
+    echo "${key}=${val}" >> "$ENV_FILE"
+  fi
+}
+
+# ── Detect platform ───────────────────────────────────────────────────────────
+detect_platform() {
+  case "$(uname -s)" in
+    Linux*)  echo "linux"  ;;
+    Darwin*) echo "darwin" ;;
+    *)       echo "unknown" ;;
+  esac
+}
+
+PLATFORM="$(detect_platform)"
+
+# ── Prerequisite check ────────────────────────────────────────────────────────
+check_prereqs() {
+  local missing=()
+
+  command -v docker       >/dev/null 2>&1 || missing+=("docker")
+  command -v node         >/dev/null 2>&1 || missing+=("node (>=20)")
+  command -v npm          >/dev/null 2>&1 || missing+=("npm")
+  command -v curl         >/dev/null 2>&1 || missing+=("curl")
+  command -v python3      >/dev/null 2>&1 || missing+=("python3")
+
+  # docker compose v2 (either 'docker compose' or legacy 'docker-compose')
+  if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+    missing+=("docker compose")
+  fi
+
+  if [ ${#missing[@]} -gt 0 ]; then
+    err "Missing required prerequisites:"
+    for m in "${missing[@]}"; do
+      printf "    %s\n" "$m"
+    done
+    echo ""
+    case "$PLATFORM" in
+      darwin)
+        err "Run the preflight installer to fix automatically:"
+        printf "    ${C_BOLD}bin/agentco-preflight-macos${C_RESET}\n"
+        ;;
+      linux)
+        err "Run the preflight installer to fix automatically:"
+        printf "    ${C_BOLD}bin/agentco-preflight-linux${C_RESET}\n"
+        ;;
+      *)
+        err "Install these manually, then rerun setup."
+        ;;
+    esac
+    return 1
+  fi
+
+  ok "Prerequisites: docker, node, npm, curl, python3 all present"
+
+  # Optional: claude CLI (required if LLM_PROVIDER=claude-cli)
+  if command -v claude >/dev/null 2>&1; then
+    ok "Claude Code CLI: $(claude --version 2>/dev/null | head -1)"
+  else
+    warn "Claude Code CLI not found (required only for LLM_PROVIDER=claude-cli)"
+    warn "Install: https://docs.claude.com/en/docs/claude-code"
+  fi
+
+  return 0
+}
+
+# ── Check mode: report + exit ─────────────────────────────────────────────────
+run_check() {
+  banner
+  heading "Install check"
+  step "Install root: $AGENT_CO_ROOT"
+  step "Platform: $PLATFORM"
+  check_prereqs || true
+
+  echo ""
+  if [ -f "$ENV_FILE" ]; then
+    ok ".env exists: $ENV_FILE"
+    local vars=(POSTGRES_PASSWORD N8N_ENCRYPTION_KEY JWT_SECRET LLM_PROVIDER)
+    for v in "${vars[@]}"; do
+      local val
+      val="$(get_env_var "$v")"
+      if [ -n "$val" ]; then
+        ok "$v is set"
+      else
+        warn "$v is not set"
+      fi
+    done
+  else
+    warn ".env missing — run setup without --check to create"
+  fi
+
+  echo ""
+  if [ -f "$MCP_FILE" ]; then ok ".mcp.json exists"; else warn ".mcp.json not generated"; fi
+
+  echo ""
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q agentco_postgres; then
+    ok "Postgres container running"
+  else
+    warn "Postgres container not running — start with: cd $AGENT_CO_ROOT/agent-company && docker compose up -d"
+  fi
+
+  if curl -sS -m 2 http://localhost:3456/health >/dev/null 2>&1; then
+    ok "Relay responding on :3456"
+  else
+    warn "Relay not responding on :3456"
+  fi
+
+  echo ""
+  exit 0
+}
+
+[ "$MODE" = "check" ] && run_check
+
+# ── Layer dispatcher ──────────────────────────────────────────────────────────
+# If no explicit --LAYER flags were passed, run the full sequence. Otherwise
+# run only the requested layers (any order; we maintain canonical ordering
+# below for dependency correctness).
+layer_enabled() {
+  local name="$1"
+  [ ${#LAYERS[@]} -eq 0 ] && return 0  # no flags = everything
+  for l in "${LAYERS[@]}"; do
+    [ "$l" = "$name" ] && return 0
+  done
+  return 1
+}
+
+FULL_SETUP=false
+[ ${#LAYERS[@]} -eq 0 ] && FULL_SETUP=true
+
+# ── Phase functions ───────────────────────────────────────────────────────────
+
+configure_name() {
+  heading "Instance name"
+  local soul="$AGENT_CO_ROOT/context/SOUL.md"
+  local soul_tmpl="$AGENT_CO_ROOT/context/SOUL.md.template"
+
+  local current=""
+  if [ -f "$soul" ]; then
+    # Try to recover current name from SOUL line "I am **X**."
+    current=$(grep -oE 'I am \*\*[^*]+\*\*' "$soul" | head -1 | sed 's/I am \*\*//' | sed 's/\*\*$//')
+  fi
+
+  printf "  ${C_DIM}This name is the agent's identity in SOUL.md (e.g. %sAtlas%s, %sPocket%s, %sHermes%s,${C_RESET}\n" "$C_BOLD" "$C_RESET$C_DIM" "$C_BOLD" "$C_RESET$C_DIM" "$C_BOLD" "$C_RESET$C_DIM"
+  printf "  ${C_DIM}%sNova%s, %sSage%s — anything you want). Independent of the Claude Code session${C_RESET}\n" "$C_BOLD" "$C_RESET$C_DIM" "$C_BOLD" "$C_RESET$C_DIM"
+  printf "  ${C_DIM}customTitle, which stays 'agent-co' for cross-channel session resume.${C_RESET}\n\n"
+
+  local default_name="${current:-Agent}"
+  local name
+  name="$(ask "Agent name (press Enter to keep default)" "$default_name")"
+  [ -z "$name" ] && name="Agent"
+
+  if [ ! -f "$soul_tmpl" ]; then
+    warn "SOUL.md.template missing — skipping name substitution"
+    return
+  fi
+
+  sed "s/{{INSTANCE_NAME}}/$name/g" "$soul_tmpl" > "$soul"
+  ok "Instance name set: $name (written to context/SOUL.md)"
+}
+
+configure_env_bootstrap() {
+  # Ensure .env exists. Non-fatal when neither .env nor .env.example exist —
+  # lets layers that don't need .env (like --path) still succeed. Downstream
+  # layers that DO need .env will fail at their own point with a clearer error.
+  if [ -f "$ENV_FILE" ]; then
+    return 0
+  fi
+  heading "Environment file"
+  if [ -f "$ENV_EXAMPLE" ]; then
+    cp "$ENV_EXAMPLE" "$ENV_FILE"
+    ok "Created .env from .env.example"
+  else
+    warn "No .env or .env.example found — skipping (any .env-dependent layer will fail explicitly)"
+  fi
+}
+
+configure_llm() {
+  heading "LLM provider"
+cat <<EOF
+  Pick one of the four providers — type the exact name shown in bold:
+
+    ${C_BOLD}claude-cli${C_RESET}      local Claude Code CLI (uses your existing subscription; no API key)
+    ${C_BOLD}anthropic-api${C_RESET}   direct Anthropic API (you supply ANTHROPIC_API_KEY)
+    ${C_BOLD}openai-api${C_RESET}      OpenAI or any OpenAI-compatible endpoint (Groq, Together,
+                    Fireworks, Cerebras, etc. — free tiers make this great for testing)
+    ${C_BOLD}ollama${C_RESET}          fully-local Ollama (no network, no cost; see docs/TESTING-PROVIDERS.md)
+EOF
+echo ""
+
+current_provider="$(get_env_var LLM_PROVIDER)"
+provider="$(ask "LLM provider name" "${current_provider:-claude-cli}")"
+set_env_var LLM_PROVIDER "$provider"
+ok "LLM_PROVIDER=$provider"
+
+case "$provider" in
+  claude-cli)
+    if ! command -v claude >/dev/null 2>&1; then
+      warn "claude CLI not found on PATH — install before starting the relay"
+      warn "  https://docs.claude.com/en/docs/claude-code"
+    fi
+    ;;
+  anthropic-api)
+    printf "  ${C_DIM}Get a key at https://console.anthropic.com/ → API Keys. New accounts get ~\$5 free credits.${C_RESET}\n"
+    current="$(get_env_var ANTHROPIC_API_KEY)"
+    key="$(ask "Anthropic API key (starts with sk-ant-)" "${current:-}" secret)"
+    [ -n "$key" ] && set_env_var ANTHROPIC_API_KEY "$key" && ok "ANTHROPIC_API_KEY set"
+    ;;
+  openai-api)
+    printf "  ${C_DIM}Compatible endpoints you can use with this provider:${C_RESET}\n"
+    printf "    ${C_DIM}OpenAI:    (leave base URL blank — defaults to api.openai.com)${C_RESET}\n"
+    printf "    ${C_DIM}Groq:      https://api.groq.com/openai/v1${C_RESET}\n"
+    printf "    ${C_DIM}Together:  https://api.together.xyz/v1${C_RESET}\n"
+    printf "    ${C_DIM}Fireworks: https://api.fireworks.ai/inference/v1${C_RESET}\n\n"
+    current="$(get_env_var OPENAI_API_KEY)"
+    key="$(ask "API key (OpenAI sk-... or provider-specific like gsk_...)" "${current:-}" secret)"
+    [ -n "$key" ] && set_env_var OPENAI_API_KEY "$key" && ok "API key set"
+    base="$(ask "Base URL (blank = OpenAI)" "$(get_env_var OPENAI_BASE_URL)")"
+    [ -n "$base" ] && set_env_var OPENAI_BASE_URL "$base"
+    ;;
+  ollama)
+    printf "  ${C_DIM}Install: https://ollama.com/download   Pull a model: ${C_BOLD}ollama pull llama3.1:8b${C_RESET}\n"
+    current="$(get_env_var OLLAMA_HOST)"
+    host="$(ask "Ollama host (press Enter for localhost)" "${current:-http://localhost:11434}")"
+    set_env_var OLLAMA_HOST "$host" && ok "OLLAMA_HOST=$host"
+    ;;
+esac
+}
+
+configure_db() {
+  heading "Database"
+current="$(get_env_var POSTGRES_PASSWORD)"
+if [ -z "$current" ]; then
+  pw="$(gen_secret 24)"
+  set_env_var POSTGRES_PASSWORD "$pw"
+  ok "Generated POSTGRES_PASSWORD (24 bytes)"
+else
+  ok "POSTGRES_PASSWORD already set"
+fi
+
+pw="$(get_env_var POSTGRES_PASSWORD)"
+set_env_var RELAY_POSTGRES_URL "postgresql://agentco:${pw}@localhost:5432/agentco"
+set_env_var DB_POSTGRESDB_PASSWORD "$pw"
+}
+
+configure_secrets() {
+  heading "n8n + relay secrets"
+if [ -z "$(get_env_var N8N_ENCRYPTION_KEY)" ]; then
+  set_env_var N8N_ENCRYPTION_KEY "$(gen_secret 32)"
+  ok "Generated N8N_ENCRYPTION_KEY (CRITICAL: never change; will invalidate n8n credentials)"
+else
+  ok "N8N_ENCRYPTION_KEY preserved"
+fi
+
+if [ -z "$(get_env_var N8N_BASIC_AUTH_PASSWORD)" ]; then
+  current_owner="$(ask "n8n UI admin password" "$(gen_secret 16)" secret)"
+  set_env_var N8N_BASIC_AUTH_PASSWORD "$current_owner"
+  set_env_var N8N_OWNER_PASSWORD "$current_owner"
+  ok "n8n admin password set"
+fi
+
+if [ -z "$(get_env_var RELAY_SECRET)" ]; then
+  set_env_var RELAY_SECRET "$(gen_secret 32)"
+  ok "Generated RELAY_SECRET"
+fi
+if [ -z "$(get_env_var JWT_SECRET)" ]; then
+  set_env_var JWT_SECRET "$(gen_secret 32)"
+  ok "Generated JWT_SECRET"
+fi
+if [ -z "$(get_env_var DASHBOARD_PASSWORD)" ]; then
+  set_env_var DASHBOARD_PASSWORD "$(gen_secret 12)"
+  ok "Generated DASHBOARD_PASSWORD"
+fi
+}
+
+configure_discord() {
+  heading "Discord bot (optional)"
+  cat <<EOF
+  ${C_DIM}To enable Discord, create a bot at https://discord.com/developers/applications :
+     1. New Application → Bot → Reset Token (save it)
+     2. Under OAuth2 → URL Generator: check "bot" scope + "Send Messages" + "Read Message History"
+     3. Visit the generated URL, add the bot to your server
+     4. Right-click the channel you want the bot to listen in → Copy Channel ID
+     (enable Developer Mode in Discord settings to see Channel ID)${C_RESET}
+
+EOF
+answer="$(ask_yn "Configure Discord bot now?" "n")"
+if [ "$answer" = "y" ]; then
+  current="$(get_env_var DISCORD_BOT_TOKEN)"
+  token="$(ask "Discord bot token" "${current:-}" secret)"
+  [ -n "$token" ] && set_env_var DISCORD_BOT_TOKEN "$token"
+
+  current="$(get_env_var DISCORD_CHANNEL_IDS)"
+  ids="$(ask "Channel IDs (comma-separated, blank=all)" "${current:-}")"
+  [ -n "$ids" ] && set_env_var DISCORD_CHANNEL_IDS "$ids"
+  ok "Discord bot configured"
+fi
+}
+
+configure_telegram() {
+  heading "Telegram bot (optional)"
+  cat <<EOF
+  ${C_DIM}To enable Telegram:
+     1. Message @BotFather on Telegram → /newbot → follow prompts, save the token
+     2. Message your new bot first (any message), then message @userinfobot to get your chat ID
+     3. Paste token + chat ID below${C_RESET}
+
+EOF
+answer="$(ask_yn "Configure Telegram bot now?" "n")"
+if [ "$answer" = "y" ]; then
+  current="$(get_env_var TELEGRAM_BOT_TOKEN)"
+  token="$(ask "Telegram bot token (from @BotFather)" "${current:-}" secret)"
+  [ -n "$token" ] && set_env_var TELEGRAM_BOT_TOKEN "$token"
+
+  current="$(get_env_var TELEGRAM_CHAT_ID)"
+  chat="$(ask "Your chat ID (from @userinfobot)" "${current:-}")"
+  [ -n "$chat" ] && set_env_var TELEGRAM_CHAT_ID "$chat"
+  ok "Telegram bot configured"
+fi
+}
+
+configure_mcp() {
+  heading "MCP server registration"
+if [ -f "$MCP_TEMPLATE" ]; then
+  sed "s|{{AGENT_CO_ROOT}}|$AGENT_CO_ROOT|g" "$MCP_TEMPLATE" > "$MCP_FILE"
+  ok "Generated .mcp.json → $MCP_FILE"
+  step "Claude Code sessions started from $AGENT_CO_ROOT will auto-load the agentco MCP server"
+else
+  warn ".mcp.json.template missing — MCP config skipped"
+fi
+}
+
+configure_build() {
+  heading "Install relay + MCP server dependencies"
+(
+  cd "$AGENT_CO_ROOT/agent-company/relay"
+  if [ -f package.json ]; then
+    step "Installing relay deps..."
+    npm install --silent 2>&1 | tail -3
+    step "Building relay..."
+    npm run build 2>&1 | tail -3
+    ok "Relay built"
+  fi
+)
+(
+  cd "$AGENT_CO_ROOT/agent-company/mcp-server"
+  if [ -f package.json ]; then
+    step "Installing MCP server deps..."
+    npm install --silent 2>&1 | tail -3
+    step "Building MCP server..."
+    npm run build 2>&1 | tail -3
+    ok "MCP server built"
+  fi
+)
+}
+
+configure_supervision() {
+  heading "Supervision"
+  answer="$(ask_yn "Install process supervision for $PLATFORM?" "y")"
+  if [ "$answer" = "y" ]; then
+    AGENT_CO_ROOT="$AGENT_CO_ROOT" "$AGENT_CO_ROOT/supervision/install.sh" install
+  fi
+}
+
+configure_hooks() {
+  local provider
+  provider="$(get_env_var LLM_PROVIDER)"
+  if [ "$provider" != "claude-cli" ]; then
+    step "LLM_PROVIDER is '$provider' — Claude Code hooks are only useful for claude-cli. Skipping."
+    return
+  fi
+  if [ ! -d "$HOME/.claude" ]; then
+    warn "~/.claude directory not found — Claude Code hooks require Claude Code CLI installed"
+    return
+  fi
+  heading "Claude Code hooks"
+  answer="$(ask_yn "Register Stop + SessionStart hooks with your Claude Code install?" "y")"
+  if [ "$answer" = "y" ]; then
+    step "This merges hook entries into $HOME/.claude/settings.json"
+    step "(idempotent — safe to re-run)"
+    local hook_persist="$AGENT_CO_ROOT/agent-company/scripts/cc-persist-hook.py"
+    local hook_session="$AGENT_CO_ROOT/agent-company/scripts/cc-session-start-hook.py"
+
+    if ! command -v jq >/dev/null 2>&1; then
+      warn "jq not installed — skipping automatic hook registration"
+      warn "Manual: add Stop + SessionStart entries to $HOME/.claude/settings.json pointing at:"
+      warn "  $hook_persist"
+      warn "  $hook_session"
+    else
+      mkdir -p "$HOME/.claude"
+      [ -f "$HOME/.claude/settings.json" ] || echo '{}' > "$HOME/.claude/settings.json"
+
+      # Backup before modifying — hook configs are load-bearing; a bad merge
+      # silently breaks persistence. The backup lets the user revert instantly.
+      local backup="$HOME/.claude/settings.json.backup.$(date +%s)"
+      cp "$HOME/.claude/settings.json" "$backup"
+      step "Backed up existing settings to $(basename "$backup")"
+
+      local tmp
+      tmp="$(mktemp)"
+      if jq --arg persist "$hook_persist" \
+            --arg session "$hook_session" \
+            '.hooks = (.hooks // {}) |
+             .hooks.Stop = [{
+               matcher: "",
+               hooks: [{type:"command", command:$persist, timeout:5}]
+             }] |
+             .hooks.SessionStart = [{
+               matcher: "",
+               hooks: [{type:"command", command:$session, timeout:5}]
+             }]' "$HOME/.claude/settings.json" > "$tmp"; then
+        mv "$tmp" "$HOME/.claude/settings.json"
+        ok "Stop + SessionStart hooks registered"
+      else
+        rm -f "$tmp"
+        err "jq merge failed; leaving settings.json unchanged. Restore from $backup if needed."
+      fi
+    fi
+  fi
+}
+
+configure_path() {
+  heading "Shell PATH registration"
+
+  local bin_dir="$AGENT_CO_ROOT/bin"
+  if [ ! -d "$bin_dir" ]; then
+    warn "bin/ directory missing at $bin_dir — skipping"
+    return
+  fi
+
+  # Resolve the primary shell + the file we'll write the export into.
+  # Marker-delimited block so we can detect + replace idempotently
+  # (handles the case where the install directory was moved since last run).
+  local shell_name shell_config
+  shell_name="$(basename "${SHELL:-/bin/sh}")"
+
+  case "$shell_name" in
+    zsh)  shell_config="$HOME/.zshrc" ;;
+    bash)
+      # On macOS, login shells read .bash_profile; on Linux they read .bashrc
+      # via .profile. Pick the one that exists; if neither, prefer the
+      # platform default.
+      if [ -f "$HOME/.bashrc" ]; then
+        shell_config="$HOME/.bashrc"
+      elif [ -f "$HOME/.bash_profile" ]; then
+        shell_config="$HOME/.bash_profile"
+      elif [ "$PLATFORM" = "darwin" ]; then
+        shell_config="$HOME/.bash_profile"
+      else
+        shell_config="$HOME/.bashrc"
+      fi
+      ;;
+    fish) shell_config="$HOME/.config/fish/config.fish" ;;
+    sh|dash) shell_config="$HOME/.profile" ;;
+    *)
+      warn "Unrecognized shell '$shell_name'; defaulting to ~/.profile"
+      shell_config="$HOME/.profile"
+      ;;
+  esac
+
+  step "Detected shell: $shell_name  →  config: $shell_config"
+
+  # Create config file + parent dir if missing
+  if [ ! -f "$shell_config" ]; then
+    mkdir -p "$(dirname "$shell_config")"
+    touch "$shell_config"
+    ok "Created $shell_config"
+  fi
+
+  local marker_start="# >>> agentco (managed; do not edit) >>>"
+  local marker_end="# <<< agentco (managed; do not edit) <<<"
+
+  # Build the export line in the right shell syntax.
+  local export_line
+  if [ "$shell_name" = "fish" ]; then
+    export_line="fish_add_path $bin_dir"
+  else
+    # Prepend so this install's binaries shadow anything else on PATH.
+    export_line="export PATH=\"$bin_dir:\$PATH\""
+  fi
+
+  # If a managed block exists, remove it — we'll write fresh (handles moves).
+  if grep -qF "$marker_start" "$shell_config" 2>/dev/null; then
+    step "Existing agentco block found; refreshing"
+    # Portable sed: write to temp then move, avoiding GNU/BSD -i differences
+    local tmp
+    tmp="$(mktemp)"
+    awk -v start="$marker_start" -v end="$marker_end" '
+      $0 == start { skip = 1; next }
+      $0 == end   { skip = 0; next }
+      !skip       { print }
+    ' "$shell_config" > "$tmp"
+    cat "$tmp" > "$shell_config"
+    rm -f "$tmp"
+  fi
+
+  # Append the fresh block (with a leading blank line for readability).
+  {
+    echo ""
+    echo "$marker_start"
+    echo "# Added by bin/agentco-setup. Run \`bin/agentco-setup --path\` to refresh."
+    echo "$export_line"
+    echo "$marker_end"
+  } >> "$shell_config"
+
+  ok "Added bin/agentco* to PATH in $shell_config"
+  step "To use in this shell, run: ${C_BOLD}source $shell_config${C_RESET}"
+  step "Or open a new terminal. Then ${C_BOLD}agentco help${C_RESET} will work from anywhere."
+}
+
+configure_memory_seeds() {
+  heading "Memory seeds"
+  local seeds_dir="$AGENT_CO_ROOT/memory-seeds"
+  if [ ! -d "$seeds_dir" ]; then
+    warn "memory-seeds/ directory missing — skipping"
+    return
+  fi
+
+  # Derive the project slug that Claude Code uses from the install CWD.
+  # Example: /home/user/agent-co → -home-user-agent-co
+  local slug
+  slug=$(echo "$AGENT_CO_ROOT" | sed 's|/|-|g' | sed 's/^-/-/')
+  local target_dir="$HOME/.claude/projects/$slug/memory"
+
+  mkdir -p "$target_dir"
+
+  local copied=0
+  for f in "$seeds_dir"/*.md; do
+    [ -f "$f" ] || continue
+    local base
+    base=$(basename "$f")
+    # Rename user_me.template.md → user_me.md
+    [ "$base" = "user_me.template.md" ] && base="user_me.md"
+    [ "$base" = "README.md" ] && continue
+    if [ ! -f "$target_dir/$base" ]; then
+      cp "$f" "$target_dir/$base"
+      copied=$((copied + 1))
+    fi
+  done
+  ok "Seeded $copied memory file(s) into $target_dir"
+  step "Edit user_me.md with your profile when you have a moment"
+}
+
+configure_reset() {
+  heading "Reset .env"
+  warn "This will REPLACE your current .env with a fresh copy from .env.example."
+  warn "All secrets will be lost. n8n credentials may be invalidated."
+  local answer
+  answer="$(ask_yn "Really reset .env?" "n")"
+  if [ "$answer" = "y" ]; then
+    [ -f "$ENV_FILE" ] && cp "$ENV_FILE" "${ENV_FILE}.backup.$(date +%s)" && step "Backed up old .env"
+    cp "$ENV_EXAMPLE" "$ENV_FILE"
+    ok ".env reset. Rerun bin/agentco-setup to populate."
+  else
+    step "Aborted."
+  fi
+}
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+configure_summary() {
+  heading "Next steps"
+cat <<EOF
+
+  ${C_GREEN}✓ Setup complete.${C_RESET}
+
+  Start the stack:
+    ${C_BOLD}cd $AGENT_CO_ROOT/agent-company && docker compose up -d${C_RESET}
+
+  Start the relay (systemd / launchd):
+    ${C_BOLD}systemctl --user start agentco-relay.service${C_RESET}   (linux)
+    ${C_BOLD}launchctl load -w ~/Library/LaunchAgents/com.agentco.relay.plist${C_RESET}   (macOS)
+
+  Verify:
+    ${C_BOLD}curl http://localhost:3456/health${C_RESET}
+    ${C_BOLD}bin/agentco-setup --check${C_RESET}
+
+  Open n8n UI:
+    ${C_BOLD}http://localhost:5678${C_RESET}
+
+  Configuration lives in: ${C_DIM}$ENV_FILE${C_RESET}
+
+  Re-run any piece later with a specific flag, e.g.:
+    ${C_BOLD}bin/agentco-setup --name${C_RESET}
+    ${C_BOLD}bin/agentco-setup --llm${C_RESET}
+    ${C_BOLD}bin/agentco-setup --discord${C_RESET}
+    ${C_BOLD}bin/agentco-setup --hooks${C_RESET}
+    ${C_BOLD}bin/agentco-setup --path${C_RESET}
+    ${C_BOLD}bin/agentco-setup --supervision${C_RESET}
+
+  Once your shell config is sourced (open a new terminal or ${C_DIM}source ~/.zshrc${C_RESET}),
+  the ${C_BOLD}agentco${C_RESET} command works from any directory.
+
+EOF
+}
+
+# ── Main dispatch ─────────────────────────────────────────────────────────────
+
+if $FULL_SETUP; then
+  banner
+  heading "Welcome"
+  cat <<EOF
+  This wizard will set up Agent Co at:
+    ${C_BOLD}$AGENT_CO_ROOT${C_RESET}
+
+  It will:
+    • check prerequisites (docker, node, npm, python3)
+    • ask you to name this agent instance
+    • generate secrets and write .env
+    • configure your LLM provider
+    • optionally wire up Discord / Telegram bots
+    • build the relay + MCP server
+    • install supervision for your platform ($PLATFORM)
+    • register Claude Code hooks (if using claude-cli provider)
+    • register bin/ on your shell PATH (.zshrc / .bashrc / etc.)
+    • seed starter memory files
+
+  Each phase is re-runnable on its own later via flags like
+  ${C_DIM}bin/agentco-setup --llm${C_RESET} or ${C_DIM}bin/agentco-setup --discord${C_RESET}.
+
+  ${C_DIM}First time on this machine? If you're missing prerequisites (Docker, modern bash on
+  macOS, Node 20+, etc.), bail out of this wizard and run:${C_RESET}
+EOF
+  case "$PLATFORM" in
+    darwin) printf "    ${C_BOLD}bin/agentco-preflight-macos${C_RESET}\n" ;;
+    linux)  printf "    ${C_BOLD}bin/agentco-preflight-linux${C_RESET}\n" ;;
+  esac
+  cat <<EOF
+
+  Already-set values in .env are preserved. Press Ctrl-C to abort at any time.
+
+EOF
+  if [ "$MODE" != "yes" ]; then
+    answer="$(ask_yn "Ready to continue?" "y")"
+    [ "$answer" = "y" ] || { err "Aborted."; exit 1; }
+  fi
+
+  heading "Prerequisites"
+  check_prereqs || exit 2
+
+  configure_name
+  configure_env_bootstrap
+  configure_llm
+  configure_db
+  configure_secrets
+  configure_discord
+  configure_telegram
+  configure_mcp
+  configure_build
+  configure_supervision
+  configure_hooks
+  configure_path
+  configure_memory_seeds
+  configure_summary
+else
+  # Explicit --LAYER flags: run only the requested layers in canonical order.
+  # Always ensure .env exists before any layer that writes to it.
+  banner
+  step "Running specific layer(s): ${LAYERS[*]}"
+  configure_env_bootstrap
+  layer_enabled "reset"        && { configure_reset; exit 0; }
+  layer_enabled "name"         && configure_name
+  layer_enabled "llm"          && configure_llm
+  layer_enabled "db"           && configure_db
+  layer_enabled "secrets"      && configure_secrets
+  layer_enabled "discord"      && configure_discord
+  layer_enabled "telegram"     && configure_telegram
+  layer_enabled "mcp"          && configure_mcp
+  layer_enabled "supervision"  && configure_supervision
+  layer_enabled "hooks"        && configure_hooks
+  layer_enabled "path"         && configure_path
+  ok "Layer(s) reconfigured."
+fi

@@ -1,0 +1,44 @@
+# Secrets — never commit
+.env
+*.env.local
+**/.env
+!.env.example
+
+# Generated files
+**/dist/
+**/node_modules/
+**/*.log
+**/*.pid
+**/tunnel-url.txt
+
+# Docker volumes
+postgres-data/
+n8n-data/
+backups/
+
+# Generated MCP config (contains absolute paths; regenerate via setup)
+.mcp.json
+
+# Generated logs directory (created by setup)
+logs/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor cruft
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temp
+tmp/
+*.tmp
+.npm/
+
+# Python bytecode
+__pycache__/
+*.pyc
+.pytest_cache/

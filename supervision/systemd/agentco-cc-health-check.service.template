@@ -1,0 +1,14 @@
+[Unit]
+Description=Agent Co — Daily Claude Code drift + hook-firing check
+After=agentco-relay.service
+Wants=agentco-relay.service
+
+[Service]
+Type=oneshot
+WorkingDirectory={{AGENT_CO_ROOT}}
+ExecStart={{AGENT_CO_ROOT}}/agent-company/scripts/cc-version-check.sh check
+StandardOutput=journal
+StandardError=journal
+Environment=HOME={{HOME}}
+Environment=AGENT_CO_ROOT={{AGENT_CO_ROOT}}
+Environment=PATH={{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin
