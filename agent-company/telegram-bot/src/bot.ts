@@ -12,8 +12,8 @@
  * every Claude response is stored in `memory.messages` — previously a gap
  * compared to Discord.
  */
-import { execFile } from 'child_process'
-import { promisify } from 'util'
+import { spawn, type ChildProcess } from 'child_process'
+import { ClaudeWatchdog } from './watchdog.js'
 import { config as loadDotenv } from 'dotenv'
 import { fileURLToPath } from 'url'
 import { dirname, resolve, join } from 'path'
@@ -45,7 +45,70 @@ try {
   console.log(`[telegram-bot] local whisper backend unavailable: ${err?.message ?? 'unknown'}`)
 }
 
-const execFileAsync = promisify(execFile)
+/**
+ * Run claude CLI with closed stdin (no waiting on stdin) and bounded buffer.
+ * Replaces execFile because:
+ *   - CC 2.1.118+ pauses ~3s on every empty-stdin invocation, then writes a
+ *     "no stdin data received" warning to stderr. execFile counts that as
+ *     stderr noise; spawn with stdio: ['ignore', ...] suppresses the wait.
+ *   - On non-zero exit, we capture the actual stderr separately rather than
+ *     letting it concatenate into err.message and get truncated.
+ */
+function runClosedStdin(
+  cmd: string,
+  args: string[],
+  opts: {
+    timeoutMs?: number
+    cwd: string
+    env: NodeJS.ProcessEnv
+    maxBufferBytes: number
+    /** Called once with the spawned child reference. Lets the watchdog
+     *  attach so it can monitor liveness and SIGTERM on retry. */
+    onSpawn?: (child: ChildProcess) => void
+  },
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: opts.cwd,
+      env: opts.env,
+    })
+    opts.onSpawn?.(child)
+    let stdout = ''
+    let stderr = ''
+    let killed = false
+    // Timeout disabled when timeoutMs is undefined / 0 / negative. Long
+    // tool-using runs (browser automation, multi-step tasks) routinely
+    // exceed any reasonable upper bound, and a hard kill mid-tool causes
+    // worse problems than waiting.
+    const useTimeout = (opts.timeoutMs ?? 0) > 0
+    const timer = useTimeout
+      ? setTimeout(() => {
+          killed = true
+          child.kill('SIGTERM')
+          setTimeout(() => child.kill('SIGKILL'), 2000).unref()
+        }, opts.timeoutMs!)
+      : null
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString()
+      if (stdout.length > opts.maxBufferBytes) {
+        stdout = stdout.slice(-opts.maxBufferBytes)
+      }
+    })
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString()
+      if (stderr.length > opts.maxBufferBytes) {
+        stderr = stderr.slice(-opts.maxBufferBytes)
+      }
+    })
+    child.on('error', err => { if (timer) clearTimeout(timer); reject(err) })
+    child.on('close', code => {
+      if (timer) clearTimeout(timer)
+      if (killed) return reject(new Error(`claude killed after ${opts.timeoutMs}ms timeout`))
+      resolve({ code: code ?? -1, stdout, stderr })
+    })
+  })
+}
 
 // ─── Config ──────────────────────────────────────────────────────────
 
@@ -64,7 +127,12 @@ if (!botToken || !chatId) {
 }
 
 const SESSION_NAME = 'agent-co'
-const CLAUDE_TIMEOUT_MS = 600_000
+// CLAUDE_TIMEOUT_MS=0 disables the kill-after-N-ms watchdog. We pulled the
+// 10-minute cap because long-horizon tool-using runs (browser automation,
+// large transcriptions, multi-step searches) routinely take longer and a
+// mid-flight SIGTERM corrupts more than it saves. Override with a positive
+// integer if you want a ceiling for a specific deployment.
+const CLAUDE_TIMEOUT_MS = parseInt(process.env.CLAUDE_TIMEOUT_MS ?? '0', 10)
 const AGENT_CO_HOME = process.env.AGENT_CO_HOME ?? resolve(process.env.HOME ?? '', 'Projects', 'agent-co')
 
 // ─── TTS toggle ──────────────────────────────────────────────────────
@@ -174,29 +242,81 @@ const client = new MessagingClient({ adapter, persistence })
 
 // ─── Claude invocation ──────────────────────────────────────────────
 
-async function askClaude(message: string): Promise<string> {
+/**
+ * Context required to wire the watchdog: where to send status updates and
+ * which Telegram message they should reply to.
+ */
+export interface AskClaudeContext {
+  chatId: string
+  replyToMessageId?: string
+  sendStatusUpdate?: (text: string, replyTo?: string) => Promise<void>
+}
+
+async function askClaude(message: string, ctx?: AskClaudeContext, attempt = 1): Promise<string> {
+  const MAX_ATTEMPTS = 2  // initial + 1 watchdog-triggered retry
   const resumeUuid = await findAgentCoSessionUUID()
   const baseArgs = ['--dangerously-skip-permissions', '--model', 'opus']
   const sessionArgs = resumeUuid
     ? ['--resume', resumeUuid]
     : ['--name', SESSION_NAME]
   // Safety: the claude CLI's argparser treats any argv starting with `-` as
-  // a flag. If the user's message happens to start with a dash (including
-  // legitimate inputs like "-h" or a markdown bullet "- do this"), the
-  // parser rejects it as "unknown option". Prefix a zero-impact space so
-  // the raw argv never starts with `-`; Claude trims it as normal whitespace.
+  // a flag. If the user's message happens to start with a dash, the parser
+  // rejects it as "unknown option". Prefix a zero-impact space.
   const safeMessage = message.startsWith('-') ? ` ${message}` : message
   const args = [...baseArgs, ...sessionArgs, '-p', safeMessage, '--output-format', 'json']
   const mode = resumeUuid ? `resume=${resumeUuid.slice(0, 8)}` : `name=${SESSION_NAME} (no existing session)`
-  console.log(`[telegram-bot] Invoking claude (${mode}, cwd=${AGENT_CO_HOME}, msg: "${message.slice(0, 80)}...")`)
+  console.log(`[telegram-bot] Invoking claude (${mode}, attempt=${attempt}, cwd=${AGENT_CO_HOME}, msg: "${message.slice(0, 80)}...")`)
+
+  // Wire up the watchdog. Only when we have a chatId for status updates
+  // and a session UUID (so we can mtime-check the JSONL).
+  let watchdog: ClaudeWatchdog | null = null
+  let retryRequested = false
+  if (ctx && ctx.sendStatusUpdate && resumeUuid && attempt < MAX_ATTEMPTS) {
+    watchdog = new ClaudeWatchdog({
+      sessionFilePath: join(PROJECT_SESSION_DIR, `${resumeUuid}.jsonl`),
+      agentCoHome: AGENT_CO_HOME,
+      chatId: ctx.chatId,
+      replyToMessageId: ctx.replyToMessageId,
+      sendTelegram: ctx.sendStatusUpdate,
+      triggerRetry: () => { retryRequested = true },
+    })
+  }
 
   try {
-    const { stdout } = await execFileAsync('claude', args, {
-      timeout: CLAUDE_TIMEOUT_MS,
-      maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env },
+    const { code, stdout, stderr } = await runClosedStdin('claude', args, {
+      timeoutMs: CLAUDE_TIMEOUT_MS,
       cwd: AGENT_CO_HOME,
+      env: { ...process.env },
+      maxBufferBytes: 10 * 1024 * 1024,
+      onSpawn: (child) => watchdog?.attach(child),
     })
+    watchdog?.detach()
+
+    // If the watchdog killed the child to force a retry, claude will exit
+    // with a non-zero code (SIGTERM). Recurse with attempt+1 — claude
+    // --resume will replay the original message into the same session
+    // context, so no information is lost.
+    if (retryRequested) {
+      console.log(`[telegram-bot] watchdog requested retry, attempt ${attempt + 1}`)
+      return askClaude(message, ctx, attempt + 1)
+    }
+
+    // The "no stdin data received in 3s" line is a benign CC 2.1+ warning.
+    const meaningfulStderr = stderr
+      .split('\n')
+      .filter(l => l.trim() && !/no stdin data received/.test(l) && !/^Warning:/.test(l))
+      .join('\n')
+
+    if (code !== 0) {
+      console.error(
+        `[telegram-bot] Claude execution failed (exit=${code}). ` +
+        `stderr=${meaningfulStderr.slice(0, 2000)} | stdout-tail=${stdout.slice(-500)}`,
+      )
+      const userFacing = meaningfulStderr.split('\n').filter(Boolean).slice(0, 3).join(' | ').slice(0, 400)
+        || `claude exited ${code} with no error message — session may be stalled`
+      return `⚠️ Claude exited ${code}: ${userFacing}`
+    }
+
     try {
       const parsed = JSON.parse(stdout)
       return parsed.result ?? stdout
@@ -204,7 +324,12 @@ async function askClaude(message: string): Promise<string> {
       return stdout
     }
   } catch (err: any) {
-    console.error(`[telegram-bot] Claude execution failed: ${err.message}`)
+    watchdog?.detach()
+    if (retryRequested) {
+      console.log(`[telegram-bot] watchdog requested retry after spawn error, attempt ${attempt + 1}`)
+      return askClaude(message, ctx, attempt + 1)
+    }
+    console.error(`[telegram-bot] Claude spawn error: ${err.message}\n${err.stack ?? ''}`)
     return `⚠️ Execution error: ${err.message.slice(0, 500)}`
   }
 }
@@ -464,7 +589,21 @@ client.onMessage(async (msg) => {
       if (queueId) await persistence.markCompleted?.(queueId)
       return
     }
-    const response = await askClaude(prompt)
+    const response = await askClaude(prompt, {
+      chatId: msg.chatId,
+      replyToMessageId: msg.messageId,
+      // Watchdog uses this to drop status updates back into the same Telegram
+      // thread without going through MessagingClient's persistence layer
+      // (status pings are noise in memory.messages).
+      sendStatusUpdate: async (text, replyTo) => {
+        await adapter.send({
+          chatId: msg.chatId,
+          text,
+          replyToMessageId: replyTo ?? msg.messageId,
+          escapeMarkdown: false,
+        }).catch(err => console.warn(`[telegram-bot] watchdog status send failed: ${err?.message ?? err}`))
+      },
+    })
     clearInterval(typingInterval)
     await client.send({
       chatId: msg.chatId,

@@ -181,10 +181,6 @@ export function createSystemRouter(): Router {
       res.status(400).json({ success: false, error: 'message is required' });
       return;
     }
-    if (message.length > 40000) {
-      res.status(413).json({ success: false, error: 'message too large (>40KB); chunk before sending' });
-      return;
-    }
 
     const botToken = process.env.DISCORD_BOT_TOKEN;
     const channelIds = (process.env.DISCORD_CHANNEL_IDS ?? '').split(',').map(s => s.trim()).filter(Boolean);
@@ -278,7 +274,7 @@ export function createSystemRouter(): Router {
 
         // Fire-and-forget research spawn. Don't await; the check should return
         // quickly. The research turn will persist to memory.messages and notify
-        // the user separately on completion.
+        // vnly separately on completion.
         if (versionDrifted) {
           const prompt = [
             `Claude Code upgraded on this machine from v${previousVersion} to v${version}.`,
@@ -288,18 +284,18 @@ export function createSystemRouter(): Router {
             `2. Reading the current Claude Code hooks documentation.`,
             `3. Comparing to what our agent-co hooks depend on: Stop event (script at agent-company/scripts/cc-persist-hook.py), SessionStart event (agent-company/scripts/cc-session-start-hook.py).`,
             ``,
-            `Then check ${homedir()}/.claude/settings.json — is our current hook configuration still valid under the new version?`,
+            `Then check /home/vnly/.claude/settings.json — is our current hook configuration still valid under the new version?`,
             ``,
             `Report:`,
             `- what changed in the hook schema (if anything)`,
             `- whether our settings.json needs updating`,
             `- if yes, the exact patch (old → new)`,
             ``,
-            `After research is complete, notify the user via the agentco MCP server's notify_all tool with a concise summary + proposed patch. If no changes needed, still notify with "CC v${version} — hook schema unchanged, nothing to update."`,
+            `After research is complete, notify vnly via the agentco MCP server's notify_all tool with a concise summary + proposed patch. If no changes needed, still notify with "CC v${version} — hook schema unchanged, nothing to update."`,
           ].join('\n');
 
           // Async spawn — do not await the /run-agent call.
-          const runAgentBody = JSON.stringify({ task: prompt, timeoutSeconds: 900 });
+          const runAgentBody = JSON.stringify({ task: prompt, timeoutSeconds: 0 });
           researchTraceId = randomUUID();
           fetch(`http://localhost:${PORT}/run-agent`, {
             method: 'POST',
@@ -331,7 +327,7 @@ export function createSystemRouter(): Router {
     }
   });
 
-  // POST /notify-telegram — self-service Telegram notification to the user's chat.
+  // POST /notify-telegram — self-service Telegram notification to vnly's chat.
   // Mirrors /notify-pocket: loads TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID from
   // the relay's env, caller passes { message } only. Telegram's per-message
   // limit is 4096 chars; we chunk at 3800 to leave room for any markdown the
@@ -340,10 +336,6 @@ export function createSystemRouter(): Router {
     const { message } = req.body ?? {};
     if (!message || typeof message !== 'string' || !message.trim()) {
       res.status(400).json({ success: false, error: 'message is required' });
-      return;
-    }
-    if (message.length > 40000) {
-      res.status(413).json({ success: false, error: 'message too large (>40KB); chunk before sending' });
       return;
     }
 
@@ -387,13 +379,9 @@ export function createSystemRouter(): Router {
     if (!db) { res.status(500).json({ error: 'No database configured' }); return; }
 
     try {
-      // Latest message from any human user. Excludes assistant/tool messages
-      // + restricts to non-null usernames so heartbeat-generated rows don't
-      // count. The CLI Stop hook sets username from AGENTCO_USERNAME (default
-      // 'user'); Discord/Telegram bots set it from the inbound platform user.
       const latestUser = await db.query<{ created_at: Date }>(
         `SELECT created_at FROM memory.messages
-         WHERE role = 'user' AND username IS NOT NULL
+         WHERE role = 'user' AND username = 'vnly'
          ORDER BY created_at DESC LIMIT 1`
       );
       const lastUserAt = latestUser.rows[0]?.created_at ?? null;

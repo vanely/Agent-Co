@@ -36,7 +36,12 @@ export function createAgentRouter(metrics: MetricsCollector): Router {
   const router = Router();
 
   router.post('/run-agent', authMiddleware, async (req: Request, res: Response) => {
-    const { task, timeoutSeconds = 300, channelId, username, originalMessage, discordMsgId }: RunAgentRequest = req.body;
+    // Default timeoutSeconds=0 disables the watchdog. We removed the
+    // 300-second cap because long-horizon tool-using runs (browser
+    // automation, multi-step searches, transcriptions) routinely exceed
+    // it and a SIGKILL mid-tool corrupts more than it saves. Callers can
+    // still pass a positive value when a hard ceiling is genuinely needed.
+    const { task, timeoutSeconds = 0, channelId, username, originalMessage, discordMsgId }: RunAgentRequest = req.body;
     const transcriptMessage = originalMessage ?? task;
     const traceId = randomUUID();
 

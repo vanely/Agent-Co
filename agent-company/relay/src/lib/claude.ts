@@ -1,20 +1,96 @@
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { readdir, readFile, stat } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
-import { getLLMProvider } from '../providers';
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * spawn-based runner that closes stdin immediately (stdio: ['ignore', ...]).
+ * execFile's promisified form keeps stdin open-but-empty, which triggers CC
+ * 2.1.118+'s "no stdin data received in 3s" warning on stderr and made our
+ * subprocess error wrapper classify it as an Execution error.
+ *
+ * Behavior preserved vs execFileAsync: timeout, maxBuffer, env, cwd. Rejects
+ * on non-zero exit (matching execFileAsync's contract) with stdout/stderr
+ * attached to the error object so callers that already read those fields
+ * keep working.
+ */
+function runClosedStdin(
+  cmd: string,
+  args: string[],
+  opts: { timeout: number; maxBuffer: number; env: NodeJS.ProcessEnv; cwd?: string },
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: opts.env,
+      cwd: opts.cwd,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let totalOut = 0;
+    let killed = false;
+
+    // Watchdog timer is opt-in (only when opts.timeout > 0). Long-horizon
+    // tool-using runs routinely exceed any reasonable cap, and SIGKILL
+    // mid-tool corrupts more than it saves. Pass timeout=0 (or omit) to
+    // disable.
+    const useTimeout = (opts.timeout ?? 0) > 0;
+    const timer = useTimeout
+      ? setTimeout(() => {
+          killed = true;
+          child.kill('SIGKILL');
+          const err: NodeJS.ErrnoException = new Error(`claude timed out after ${opts.timeout}ms`);
+          err.code = 'ETIMEDOUT';
+          reject(err);
+        }, opts.timeout!)
+      : null;
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      totalOut += chunk.length;
+      if (totalOut > opts.maxBuffer) {
+        killed = true;
+        child.kill('SIGKILL');
+        reject(new Error(`stdout exceeded maxBuffer (${opts.maxBuffer})`));
+        return;
+      }
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    child.on('error', (err) => {
+      if (timer) clearTimeout(timer);
+      if (!killed) reject(err);
+    });
+
+    child.on('close', (code) => {
+      if (timer) clearTimeout(timer);
+      if (killed) return;
+      if (code !== 0) {
+        const err: any = new Error(`Command failed with exit code ${code}: ${stderr.slice(0, 300)}`);
+        err.code = code;
+        err.stdout = stdout;
+        err.stderr = stderr;
+        reject(err);
+      } else {
+        resolve({ stdout, stderr });
+      }
+    });
+  });
+}
+
 export function getProjectSessionDir(): string {
   // Claude Code keys session state by cwd. Spawning from AGENT_CO_HOME below
-  // means our sessions land under a slug derived from that path.
+  // means our sessions land under -home-vnly-Projects-agent-co.
   const projectsDir = join(homedir(), '.claude', 'projects');
   const home = process.env.HOME ?? homedir();
-  const targetCwd = process.env.AGENT_CO_HOME
-    ?? process.env.AGENT_CO_ROOT
-    ?? join(home, 'agent-co');
+  const targetCwd = process.env.AGENT_CO_HOME ?? join(home, 'Projects', 'agent-co');
   const slug = targetCwd.replace(/\//g, '-').replace(/^-/, '-');
   return join(projectsDir, slug);
 }
@@ -100,26 +176,46 @@ export async function getSessionTokenCount(sessionUUID: string): Promise<number>
   return 0;
 }
 
-// Delegates to the active LLM provider (selected via LLM_PROVIDER env var).
-// Provider-specific semantics (session resume only for claude-cli; history-
-// passing for API providers) are handled inside each provider implementation.
+// Claude sessions are keyed by CWD. Spawn from the agent-co project root so
+// every channel (Discord via relay, Telegram bot, autonomous work) converges
+// on the same session state under ~/.claude/projects/-home-vnly-Projects-agent-co.
+const AGENT_CO_HOME =
+  process.env.AGENT_CO_HOME ??
+  (process.env.HOME ? `${process.env.HOME}/Projects/agent-co` : undefined);
+
 export async function runClaude(
   task: string,
   opts: {
     timeoutSeconds: number;
     resumeUUID?: string;
     sessionName?: string;
-    systemPrompt?: string;
-    history?: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
   }
 ): Promise<{ stdout: string; stderr: string }> {
-  const provider = getLLMProvider();
-  const result = await provider.run(task, {
-    timeoutSeconds: opts.timeoutSeconds,
-    resumeUUID: opts.resumeUUID,
-    sessionName: opts.sessionName,
-    systemPrompt: opts.systemPrompt,
-    history: opts.history,
+  const args: string[] = ['--dangerously-skip-permissions', '--model', 'opus'];
+
+  if (opts.resumeUUID) {
+    args.push('--resume', opts.resumeUUID);
+  } else if (opts.sessionName) {
+    args.push('--name', opts.sessionName);
+  }
+
+  args.push('-p', task, '--output-format', 'json');
+
+  // Use runClosedStdin (spawn-based) instead of execFileAsync. Closes stdin
+  // immediately so CC 2.1.118+ doesn't wait 3s and emit the stdin warning
+  // on stderr that the telegram bot's error wrapper was classifying as an
+  // Execution error.
+  const { stdout, stderr } = await runClosedStdin('claude', args, {
+    timeout: opts.timeoutSeconds * 1000,
+    maxBuffer: 10 * 1024 * 1024,
+    env: { ...process.env },
+    cwd: AGENT_CO_HOME,
   });
-  return { stdout: result.output, stderr: result.stderr ?? '' };
+
+  try {
+    const parsed = JSON.parse(stdout);
+    return { stdout: parsed.result ?? stdout, stderr };
+  } catch {
+    return { stdout, stderr };
+  }
 }

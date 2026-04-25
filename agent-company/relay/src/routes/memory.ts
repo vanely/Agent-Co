@@ -133,7 +133,7 @@ export function createMemoryRouter(): Router {
 
   // POST /mark-learning-consolidated — mark a batch of entries as processed.
   // Called by the consolidation agent once it has drafted the brief +
-  // notified the user. Optionally attaches a consolidation_proposal_id linking
+  // notified vnly. Optionally attaches a consolidation_proposal_id linking
   // to memory.skill_contributions if a proposal was filed.
   router.post('/mark-learning-consolidated', authMiddleware, async (req: Request, res: Response) => {
     const { ids, proposalId, archivedReason } = req.body ?? {};
@@ -166,7 +166,7 @@ export function createMemoryRouter(): Router {
   // (fire-and-forget on the agent spawn). The agent is responsible for:
   //   1. GET /pending-learnings
   //   2. Grouping + drafting PROPOSED SKILL UPDATE markers
-  //   3. POST to notify_all via MCP (fan-out to user)
+  //   3. POST to notify_all via MCP (fan-out to vnly)
   //   4. POST /mark-learning-consolidated with the processed ids
   router.post('/consolidate-learnings', authMiddleware, async (req: Request, res: Response) => {
     const { minPending = 5, force = false } = req.body ?? {};
@@ -185,19 +185,17 @@ export function createMemoryRouter(): Router {
       }
 
       const PORT_LOCAL = process.env.PORT ?? '3456';
-      const skillsRoot = process.env.SKILL_LIBRARY_ROOT
-        ?? (process.env.AGENT_CO_ROOT ? `${process.env.AGENT_CO_ROOT}/skills` : `${process.env.HOME}/agent-co/skills`);
       const prompt = [
         `Consolidate the pending learning-journal entries into skill-doc proposals.`,
         ``,
         `Procedure:`,
-        `1. GET http://localhost:${PORT_LOCAL}/pending-learnings (with the RELAY_SECRET bearer).`,
+        `1. GET http://localhost:${PORT_LOCAL}/pending-learnings (with the RELAY_SECRET bearer from /home/vnly/Projects/agent-co/agent-company/.env).`,
         `2. For each skill_tag group (thinking / building / ideating / diagnosing), review the excerpts. Look for:`,
         `   - Repeated patterns (3+ excerpts pointing at the same methodology)`,
         `   - Novel single-shot insights that deserve a new section`,
-        `   - Refinements to existing sections (match by keyword against the current skill doc at ${skillsRoot}/{THINKING,BUILDING,IDEATION,DIAGNOSTICS}.md)`,
+        `   - Refinements to existing sections (match by keyword against the current skill doc at /home/vnly/Projects/shield-proposal/skills/{THINKING,BUILDING,IDEATION,DIAGNOSTICS}.md)`,
         `3. Draft a brief: for each skill with proposed changes, show the current section being refined + the proposed delta. Keep each proposal focused and small.`,
-        `4. Use the agentco MCP notify_all tool to broadcast the brief to the user on Discord + Telegram (if configured).`,
+        `4. Use the agentco MCP notify_all tool to broadcast the brief to vnly on Discord + Telegram.`,
         `5. POST to http://localhost:${PORT_LOCAL}/mark-learning-consolidated with the ids of the processed entries.`,
         ``,
         `Important:`,
@@ -210,7 +208,7 @@ export function createMemoryRouter(): Router {
       fetch(`http://localhost:${PORT_LOCAL}/run-agent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RELAY_SECRET}` },
-        body: JSON.stringify({ task: prompt, timeoutSeconds: 900 }),
+        body: JSON.stringify({ task: prompt, timeoutSeconds: 0 }),
       }).catch(err => logger.error({ err: String(err) }, 'consolidation spawn failed'));
 
       emitEvent({
@@ -234,7 +232,7 @@ export function createMemoryRouter(): Router {
   //   channelId:        string (default "cli-pocket")
   //   userContent:      string (optional — the user's message that prompted the turn)
   //   assistantContent: string (required — Pocket's response for this turn)
-  //   username:         string (optional — identifies the user; defaults to null)
+  //   username:         string (optional — defaults to null, will be "vnly" for his sessions)
   //   traceId:          string (optional — correlation ID if caller wants it)
   router.post('/persist-cli-turn', authMiddleware, async (req: Request, res: Response) => {
     const {
